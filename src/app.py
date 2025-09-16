@@ -27,7 +27,7 @@ from payment_service import PaymentService
 class RetailApp:
     """Main application class encapsulating business logic for the retail app."""
 
-    def __init__(self, db_path: str = "retail.db") -> None:
+    def __init__(self, db_path: str = "../db/retail.db") -> None:
         """Initialize the application.
 
         :param db_path: Path to the SQLite database file.  If the file does
