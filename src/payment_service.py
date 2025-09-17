@@ -34,12 +34,29 @@ class PaymentService:
         :param method: Payment method chosen by the user, e.g. 'Cash' or 'Card'.
         :returns: Tuple of (approved, reference).  ``approved`` is True
             if the payment succeeds, False otherwise.  ``reference``
-            contains a mock transaction ID or failure code.
+            contains a mock transaction ID or a reason for decline.
+
+        The default behaviour is governed by the ``always_approve`` flag.  In
+        this assignment implementation we override that behaviour to
+        satisfy the requirement that cash payments always fail and card
+        payments always succeed.  Additional or unknown payment
+        methods fall back to the behaviour specified by ``always_approve``.
         """
+        # Normalise method to lower case for comparison
+        method_lower = method.strip().lower()
+        # Special handling for assignment requirements
+        if method_lower == "cash":
+            # Always fail cash payments
+            return False, "Cash payments are currently not accepted"
+        if method_lower == "card":
+            # Always succeed card payments
+            ref = f"TXN-{int(datetime.datetime.utcnow().timestamp()*1000)}"
+            return True, ref
+        # For other methods, defer to the always_approve flag
         if self.always_approve:
-            ref = f"PAY-{int(datetime.datetime.utcnow().timestamp()*1000)}"
+            ref = f"TXN-{int(datetime.datetime.utcnow().timestamp()*1000)}"
             return True, ref
         else:
             success = random.choice([True, False])
-            ref = f"PAY-{int(datetime.datetime.utcnow().timestamp()*1000)}"
+            ref = f"TXN-{int(datetime.datetime.utcnow().timestamp()*1000)}"
             return success, ref

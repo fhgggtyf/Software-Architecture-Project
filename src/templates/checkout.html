@@ -1,0 +1,16 @@
+{% extends "_layout.html" %}
+{% block content %}
+<h1>Checkout</h1>
+<p><strong>Total:</strong> {{ "%.2f"|format(totals.total) }}</p>
+
+<form method="post" action="{{ url_for('checkout_post') }}">
+    <label>
+        Payment Method:
+        <select name="payment_method">
+            <option>Card</option>
+            <option>Cash</option>
+        </select>
+    </label>
+    <button type="submit">Pay</button>
+</form>
+{% endblock %}

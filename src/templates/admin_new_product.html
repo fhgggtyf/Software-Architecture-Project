@@ -1,0 +1,27 @@
+{% extends "_layout.html" %}
+{% block content %}
+<h1>Admin – New Product</h1>
+
+<form method="post" action="{{ url_for('admin_new_product_post') }}">
+    <p>
+        <label>
+            Name<br>
+            <input name="name" required autofocus>
+        </label>
+    </p>
+    <p>
+        <label>
+            Price<br>
+            <input name="price" type="number" step="0.01" min="0" value="0.00" required>
+        </label>
+    </p>
+    <p>
+        <label>
+            Stock<br>
+            <input name="stock" type="number" min="0" value="0" required>
+        </label>
+    </p>
+    <button type="submit">Create</button>
+    <a href="{{ url_for('admin_products') }}">Cancel</a>
+</form>
+{% endblock %}

@@ -1,189 +1,175 @@
-"""
-Business logic layer for the minimal retail application.
+# src/app.py
+from __future__ import annotations
 
-This module defines the ``RetailApp`` class which orchestrates
-interactions between the data access layer (DAOs) and the payment
-service.  It exposes high‑level methods for user registration,
-authentication, product management, cart operations, and checkout.
-All database updates related to a sale are performed atomically
-inside a transaction to satisfy the postconditions described in the
-assignment.
-"""
-
-import sqlite3
-from typing import Dict, List, Optional, Tuple
+from dataclasses import dataclass
+from typing import Dict, List, Tuple
 
 from dao import (
-    Product,
+    UserDAO,
     ProductDAO,
+    PaymentDAO,
     SaleDAO,
     SaleItemData,
-    UserDAO,
-    PaymentDAO,
+    get_request_connection,
 )
 from payment_service import PaymentService
 
+@dataclass
+class CartLine:
+    """A line in the in‑memory shopping cart."""
+    product_id: int
+    qty: int
+    unit_price: float
 
 class RetailApp:
-    """Main application class encapsulating business logic for the retail app."""
+    """
+    Business logic for the retail system. Exposes methods for registration,
+    login, cart management, and checkout. Uses per‑request DB connections.
+    """
 
-    def __init__(self, db_path: str = "../db/retail.db") -> None:
-        """Initialize the application.
+    def __init__(self) -> None:
+        # DAOs use per‑request connections
+        self.user_dao = UserDAO()
+        self.product_dao = ProductDAO()
+        self.sale_dao = SaleDAO()
+        self.payment_dao = PaymentDAO()
+        self.payment_service = PaymentService()
 
-        :param db_path: Path to the SQLite database file.  If the file does
-            not exist it will be created automatically.  Using a file
-            rather than an in‑memory database ensures persistence across
-            restarts as required by the specification.
-        """
-        self.conn = sqlite3.connect(db_path, isolation_level=None)
-        self.conn.row_factory = sqlite3.Row
-        # Instantiate DAOs
-        self.user_dao = UserDAO(self.conn)
-        self.product_dao = ProductDAO(self.conn)
-        self.sale_dao = SaleDAO(self.conn)
-        self.payment_dao = PaymentDAO(self.conn)
-        # Payment service always approves by default; set always_approve=False
-        # during testing to simulate failures.
-        self.payment_service = PaymentService(always_approve=True)
-        # Session state
-        self.current_user_id: Optional[int] = None
-        self.cart: Dict[int, int] = {}
+        # Cart keyed by product_id
+        self._cart: Dict[int, CartLine] = {}
+        self._current_user_id: int | None = None
 
-    # -------------------------------------------------------------------------
-    # User management
-    # -------------------------------------------------------------------------
-    def register(self, username: str, password: str) -> bool:
-        """Create a new user account."""
-        return self.user_dao.register_user(username, password)
+    # ---- Authentication ----
+
+    def register(self, username: str, password: str) -> Tuple[bool, str]:
+        ok = self.user_dao.register_user(username, password)
+        return (ok, "User registered." if ok else "Username already exists.")
 
     def login(self, username: str, password: str) -> bool:
-        """Authenticate a user and populate `current_user_id` on success."""
-        user_id = self.user_dao.authenticate(username, password)
-        if user_id is not None:
-            self.current_user_id = user_id
-            return True
-        return False
+        uid = self.user_dao.authenticate(username, password)
+        self._current_user_id = uid
+        return uid is not None
 
-    # -------------------------------------------------------------------------
-    # Product management
-    # -------------------------------------------------------------------------
-    def add_product(self, name: str, price: float, stock: int) -> int:
-        """Add a new product to the catalog."""
-        return self.product_dao.add_product(name, price, stock)
+    def current_user_is_admin(self, username: str) -> bool:
+        """Return True if the specified user has admin rights."""
+        return self.user_dao.is_admin(username)
 
-    def list_products(self) -> List[Product]:
-        """Return a list of all products available in the store."""
+    # ---- Product catalogue ----
+
+    def list_products(self):
         return self.product_dao.list_products()
 
-    # -------------------------------------------------------------------------
-    # Cart operations
-    # -------------------------------------------------------------------------
-    def add_to_cart(self, product_id: int, quantity: int) -> Tuple[bool, str]:
-        """Attempt to add a product to the current user's cart.
+    # ---- Cart operations ----
 
-        Validates that the product exists and that the quantity requested
-        does not exceed available stock.  It also merges quantities if
-        the product is already in the cart.
-        """
-        product = self.product_dao.get_product(product_id)
-        if product is None:
-            return False, "Product not found"
-        existing_qty = self.cart.get(product_id, 0)
-        if quantity + existing_qty > product.stock:
-            return False, f"Only {product.stock - existing_qty} in stock"
-        self.cart[product_id] = existing_qty + quantity
-        return True, f"Added {quantity} x {product.name} to cart"
+    def add_to_cart(self, product_id: int, qty: int) -> Tuple[bool, str]:
+        if qty <= 0:
+            return False, "Quantity must be positive."
 
-    def view_cart(self) -> List[Tuple[Product, int, float]]:
-        """Return a list of cart items along with quantity and line total."""
-        items: List[Tuple[Product, int, float]] = []
-        for product_id, qty in self.cart.items():
-            product = self.product_dao.get_product(product_id)
-            if product:
-                items.append((product, qty, product.price * qty))
-        return items
+        p = self.product_dao.get_product(product_id)
+        if not p:
+            return False, "Product not found."
 
-    # -------------------------------------------------------------------------
-    # Checkout / Purchase workflow
-    # -------------------------------------------------------------------------
+        if qty > p.stock:
+            return False, f"Only {p.stock} in stock"
+
+        self._cart[product_id] = CartLine(product_id=product_id, qty=qty, unit_price=p.price)
+        return True, f"Added {qty} x {p.name} to cart"
+
+    def remove_from_cart(self, product_id: int) -> None:
+        self._cart.pop(product_id, None)
+
+    def clear_cart(self) -> None:
+        self._cart.clear()
+
+    def view_cart(self) -> List[CartLine]:
+        return list(self._cart.values())
+
+    @dataclass
+    class Totals:
+        subtotal: float
+        total: float
+
+    def compute_cart_totals(self) -> Totals:
+        subtotal = sum(line.unit_price * line.qty for line in self._cart.values())
+        return RetailApp.Totals(subtotal=subtotal, total=subtotal)
+
+    # ---- Checkout ----
+
     def checkout(self, payment_method: str) -> Tuple[bool, str]:
-        """Complete the purchase and record a sale.
+        if not self._current_user_id:
+            return False, "You must be logged in."
+        if not self._cart:
+            return False, "Cart is empty."
 
-        Implements the main success scenario for registering a sale.  Steps:
-        1. Validate cart is not empty and user is logged in.
-        2. Validate stock levels for each item; if any product is
-           insufficient, rollback and return an error message.
-        3. Compute subtotal and total (the implementation uses no
-           additional taxes/fees for simplicity but could be extended).
-        4. Process the payment via ``PaymentService``.  If the payment
-           fails, do not persist the sale or update stock.
-        5. Within a single transaction: create the sale and sale items,
-           decrement stock accordingly, and record the payment.  If
-           anything goes wrong the transaction will rollback.
-        6. Clear the cart and return success status and receipt info.
-        """
-        if self.current_user_id is None:
-            return False, "User must be logged in to checkout"
-        if not self.cart:
-            return False, "Cart is empty"
-        # Validate stock and prepare sale items
-        sale_items: List[SaleItemData] = []
-        subtotal = 0.0
-        for product_id, qty in self.cart.items():
-            product = self.product_dao.get_product(product_id)
-            if product is None:
-                return False, f"Product with ID {product_id} not found"
-            if qty > product.stock:
-                return False, f"Insufficient stock for {product.name}; only {product.stock} available"
-            sale_items.append(SaleItemData(product_id, qty, product.price))
-            subtotal += product.price * qty
-        total = subtotal  # Extend here for taxes/fees/discounts
-        # Process payment
+        # Revalidate stock before payment
+        for line in self._cart.values():
+            p = self.product_dao.get_product(line.product_id)
+            if not p:
+                return False, "A product in your cart no longer exists."
+            if line.qty > p.stock:
+                return False, f"Only {p.stock} in stock for {p.name}"
+
+        totals = self.compute_cart_totals()
+        total = totals.total
+
+        # Call mock payment gateway
         approved, reference = self.payment_service.process_payment(total, payment_method)
         if not approved:
-            return False, f"Payment was declined (reference: {reference})"
-        # Persist sale, sale items, decrement stock and record payment
-        try:
-            with self.conn:
-                sale_id = self.sale_dao.create_sale(
-                    user_id=self.current_user_id,
-                    items=sale_items,
-                    subtotal=subtotal,
-                    total=total,
-                    status="Completed",
-                )
-                # Update stock
-                for item in sale_items:
-                    product = self.product_dao.get_product(item.product_id)
-                    if product is None:
-                        raise ValueError(f"Product with ID {item.product_id} missing during checkout")
-                    new_stock = product.stock - item.quantity
-                    if new_stock < 0:
-                        raise RuntimeError(
-                            f"Concurrency conflict: insufficient stock for {product.name}"
-                        )
-                    self.product_dao.update_stock(item.product_id, new_stock)
-                # Record payment
-                self.payment_dao.record_payment(
-                    sale_id=sale_id,
-                    method=payment_method,
-                    reference=reference,
-                    amount=total,
-                    status="Approved",
-                )
-            # Clear cart and build receipt
-            self.cart.clear()
-            receipt_lines = [f"Sale ID: {sale_id}"]
-            for item in sale_items:
-                product = self.product_dao.get_product(item.product_id)
-                line_total = item.unit_price * item.quantity
-                receipt_lines.append(
-                    f" - {product.name} x {item.quantity} @ {item.unit_price:.2f} = {line_total:.2f}"
-                )
-            receipt_lines.append(f"Subtotal: {subtotal:.2f}")
-            receipt_lines.append(f"Total: {total:.2f}")
-            receipt_lines.append(f"Payment Method: {payment_method}")
-            receipt_lines.append(f"Payment Ref: {reference}")
-            return True, "\n".join(receipt_lines)
-        except Exception as e:
-            return False, str(e)
+            # Payment failed: nothing persisted
+            return False, reference
+
+        # Persist sale and decrement stock atomically
+        conn = get_request_connection()
+        user_dao = UserDAO(conn)
+        product_dao = ProductDAO(conn)
+        sale_dao = SaleDAO(conn)
+        payment_dao = PaymentDAO(conn)
+
+        items = [
+            SaleItemData(product_id=ln.product_id, quantity=ln.qty, unit_price=ln.unit_price)
+            for ln in self._cart.values()
+        ]
+
+        with conn:
+            # Extra check for concurrency at commit time
+            for ln in self._cart.values():
+                p = product_dao.get_product(ln.product_id)
+                if not p or p.stock < ln.qty:
+                    raise RuntimeError("Insufficient stock at commit time.")
+
+            sale_id = sale_dao.create_sale(
+                user_id=self._current_user_id,
+                items=items,
+                subtotal=totals.subtotal,
+                total=totals.total,
+                status="Completed",
+            )
+
+            # Update stock
+            for ln in self._cart.values():
+                p = product_dao.get_product(ln.product_id)
+                product_dao.update_stock(p.id, p.stock - ln.qty)
+
+            # Record payment
+            payment_dao.record_payment(
+                sale_id=sale_id,
+                method=payment_method,
+                reference=reference,
+                amount=total,
+                status="Approved",
+            )
+
+        # Build receipt text
+        receipt_lines = [f"Sale ID: {sale_id}"]
+        for ln in self._cart.values():
+            p = self.product_dao.get_product(ln.product_id)
+            receipt_lines.append(
+                f" - {p.name} x {ln.qty} @ {ln.unit_price:.2f} = {ln.unit_price * ln.qty:.2f}"
+            )
+        receipt_lines.append(f"Subtotal: {totals.subtotal:.2f}")
+        receipt_lines.append(f"Total: {totals.total:.2f}")
+        receipt_lines.append(f"Payment Method: {payment_method}")
+        receipt_lines.append(f"Payment Ref: {reference}")
+
+        self.clear_cart()
+        return True, "\n".join(receipt_lines)

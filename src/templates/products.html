@@ -1,0 +1,28 @@
+{% extends "_layout.html" %}
+{% block content %}
+<h1>Products</h1>
+<table border="1" cellpadding="6" cellspacing="0">
+    <tr>
+        <th>ID</th>
+        <th>Name</th>
+        <th>Price</th>
+        <th>Stock</th>
+        <th></th>
+    </tr>
+    {% for p in products %}
+    <tr>
+        <td>{{ p.id }}</td>
+        <td>{{ p.name }}</td>
+        <td>{{ "%.2f"|format(p.price) }}</td>
+        <td>{{ p.stock }}</td>
+        <td>
+            <form method="post" action="{{ url_for('cart_add') }}">
+                <input type="hidden" name="product_id" value="{{ p.id }}">
+                <input name="quantity" type="number" min="1" value="1" required>
+                <button type="submit">Add to cart</button>
+            </form>
+        </td>
+    </tr>
+    {% endfor %}
+</table>
+{% endblock %}

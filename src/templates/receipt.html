@@ -1,0 +1,8 @@
+{% extends "_layout.html" %}
+{% block content %}
+<h1>Receipt</h1>
+<pre>{{ text_receipt }}</pre>
+<p>
+    <a href="{{ url_for('products') }}">Back to products</a>
+</p>
+{% endblock %}
