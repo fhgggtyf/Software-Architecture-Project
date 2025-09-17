@@ -1,10 +1,21 @@
 """
 Data Access Objects (DAOs) and domain models for the minimal retail app.
 
-This module implements a per‑request SQLite connection for Flask using flask.g.
-If no Flask app context is active (e.g. during CLI/tests), a thread‑local
-connection is used. Each DAO lazily resolves a connection via get_request_connection().
+This module uses Python's built-in sqlite3.Connections are managed per 
+thread via a module-level thread-local; call`get_request_connection()` to 
+obtain the current thread's connection.
+
+Database path resolution:
+- `RETAIL_DB_PATH` environment variable, if set
+- Otherwise defaults to ../db/retail.db (resolved relative to this file)
+
+Each DAO lazily resolves a connection via `get_request_connection()` unless an
+explicit `sqlite3.Connection` is passed to the DAO's constructor. Use an
+explicit connection (and a `with conn:` block) to group operations atomically.
+
+Foreign keys are enabled (`PRAGMA foreign_keys = ON`) for every new connection.
 """
+
 
 from __future__ import annotations
 
@@ -16,14 +27,18 @@ import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
 
-try:
-    # These are only available when running under Flask
-    from flask import g, current_app, has_app_context  # type: ignore
-except Exception:
-    g = None  # type: ignore
+# In the original implementation this module attempted to import
+# ``flask.g`` and related functions in order to maintain a per‑request
+# database connection when running under a Flask application.  Since
+# Flask is no longer a dependency of this project, we instead rely on
+# a thread‑local storage object to hold per‑session connections.  The
+# ``has_app_context`` function now always returns ``False`` so that
+# Flask‑specific code paths are bypassed.
+g = threading.local()  # type: ignore
 
-    def has_app_context() -> bool:  # type: ignore
-        return False
+def has_app_context() -> bool:
+    """Return False to indicate that no Flask app context is active."""
+    return False
 
 ###############################################################################
 # Connection management (per request with Flask, fallback to thread‑local)
@@ -52,13 +67,14 @@ def _new_connection(db_path: str) -> sqlite3.Connection:
 
 def _resolve_db_path() -> str:
     """
-    Determine the database file to use.
-    Priority: Flask config DB_PATH > environment variable RETAIL_DB_PATH > default.
+    Determine the path to the database file.
+
+    Without Flask in the picture the configuration is simplified:
+    * If the ``RETAIL_DB_PATH`` environment variable is set, its value
+      is used.
+    * Otherwise the built‑in default of ``db/retail.db`` relative to
+      this source file is returned.
     """
-    if has_app_context():
-        db_path = current_app.config.get("DB_PATH")  # type: ignore[attr-defined]
-        if db_path:
-            return db_path
     return os.environ.get("RETAIL_DB_PATH", _DEFAULT_DB_PATH)
 
 def get_request_connection() -> sqlite3.Connection:
@@ -413,22 +429,10 @@ class SaleDAO(BaseDAO):
         items = [SaleItemData(*row) for row in item_cur.fetchall()]
         return sale, items
 
-def set_admin(self, username: str, is_admin: bool = True) -> bool:
-    """Grant or revoke admin privileges for a username."""
-    conn = self._conn()
-    try:
-        with conn:
-            conn.execute(
-                "UPDATE User SET is_admin = ? WHERE username = ?;",
-                (1 if is_admin else 0, username),
-            )
-        return True
-    except Exception:
-        return False
-
-def is_admin(self, username: str) -> bool:
-    """Return True if the user has admin privileges."""
-    conn = self._conn()
-    cur = conn.execute("SELECT is_admin FROM User WHERE username = ?;", (username,))
-    row = cur.fetchone()
-    return bool(row["is_admin"]) if row else False
+# NOTE: the functions below were originally defined at module scope.  They
+# effectively duplicated the `set_admin` and `is_admin` methods on `UserDAO` and
+# operated on whichever connection happened to be returned by
+# `get_request_connection()`.  Having module‑level functions that shadow
+# instance methods can lead to confusing behaviour and bugs, so these
+# definitions were removed.  Please use the `UserDAO.set_admin` and
+# `UserDAO.is_admin` methods on a DAO instance instead.

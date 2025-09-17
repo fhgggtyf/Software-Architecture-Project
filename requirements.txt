@@ -1,1 +1,4 @@
-Flask==3.0.0
+# No third‑party libraries are required for this project.  Flask has been
+# removed in favour of a simple command‑line interface, so only pytest is
+# needed for running the test suite.
+pytest
