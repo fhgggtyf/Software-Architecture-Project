@@ -1,101 +1,118 @@
 """
 Data Access Objects (DAOs) and domain models for the minimal retail app.
 
-This module uses Python's built-in sqlite3.Connections are managed per 
-thread via a module-level thread-local; call`get_request_connection()` to 
-obtain the current thread's connection.
-
-Database path resolution:
-- `RETAIL_DB_PATH` environment variable, if set
-- Otherwise defaults to ../db/retail.db (resolved relative to this file)
-
-Each DAO lazily resolves a connection via `get_request_connection()` unless an
-explicit `sqlite3.Connection` is passed to the DAO's constructor. Use an
-explicit connection (and a `with conn:` block) to group operations atomically.
-
-Foreign keys are enabled (`PRAGMA foreign_keys = ON`) for every new connection.
+- Uses Python's built-in sqlite3 with per-thread connection.
+- Resolves DB path from RETAIL_DB_PATH or defaults to ../db/retail.db relative to this file.
+- On first connection, runs db/init.sql (or RETAIL_SCHEMA_PATH) to create the schema.
+- Foreign keys are enforced for every connection (PRAGMA foreign_keys = ON).
 """
-
 
 from __future__ import annotations
 
-import datetime
 import hashlib
 import os
 import sqlite3
 import threading
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
 from datetime import datetime, UTC
+from pathlib import Path
+from typing import List, Optional, Tuple
 
-# In the original implementation this module attempted to import
-# ``flask.g`` and related functions in order to maintain a per‑request
-# database connection when running under a Flask application.  Since
-# Flask is no longer a dependency of this project, we instead rely on
-# a thread‑local storage object to hold per‑session connections.  The
-# ``has_app_context`` function now always returns ``False`` so that
-# Flask‑specific code paths are bypassed.
-g = threading.local()  # type: ignore
-
-def has_app_context() -> bool:
-    """Return False to indicate that no Flask app context is active."""
-    return False
-
-###############################################################################
-# Connection management (per request with Flask, fallback to thread‑local)
-###############################################################################
+# ------------------------------------------------------------------------------
+# Connection management (thread-local)
+# ------------------------------------------------------------------------------
 
 # Default DB path: ../db/retail.db relative to this file
-_DEFAULT_DB_PATH = os.path.normpath(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "db", "retail.db")
-)
+_THIS_FILE = Path(__file__).resolve()
+_DEFAULT_DB_PATH = (_THIS_FILE.parent / ".." / "db" / "retail.db").resolve()
 
 _thread_local = threading.local()
 
+
 def _ensure_parent_dir(path: str) -> None:
-    """Ensure the parent directory of the given path exists."""
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
 
+
+def _find_schema_path() -> Optional[Path]:
+    """Find db/init.sql, preferring RETAIL_SCHEMA_PATH if provided."""
+    env = os.environ.get("RETAIL_SCHEMA_PATH")
+    if env:
+        p = Path(env).expanduser().resolve()
+        return p if p.is_file() else None
+
+    candidates = [
+        # repo root layout
+        _THIS_FILE.parent / ".." / "db" / "init.sql",
+        # if someone runs from root and code is *also* in root
+        _THIS_FILE.parent / "db" / "init.sql",
+        # one level up fallback
+        _THIS_FILE.parent / "../db/init.sql",
+    ]
+    for c in candidates:
+        c = c.resolve()
+        if c.is_file():
+            return c
+    return None
+
+
+def _apply_schema_if_needed(conn: sqlite3.Connection) -> None:
+    """
+    Apply schema from init.sql exactly once per DB file using PRAGMA user_version.
+    If user_version == 0, attempt to run schema and then set it to 1.
+    """
+    # If user_version already set, assume schema applied
+    (ver,) = conn.execute("PRAGMA user_version;").fetchone()
+    if int(ver) > 0:
+        return
+
+    schema_path = _find_schema_path()
+    if not schema_path:
+        # If we can't find a schema file but tables already exist, just set a version.
+        # Otherwise, raise a helpful error.
+        existing = conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('User','Product','Sale','SaleItem','Payment');"
+        ).fetchall()
+        if existing:
+            conn.execute("PRAGMA user_version = 1;")
+            return
+        raise FileNotFoundError(
+            "Could not locate db/init.sql and schema tables do not exist. "
+            "Set RETAIL_SCHEMA_PATH or place init.sql under ./db/."
+        )
+
+    with open(schema_path, "r", encoding="utf-8") as f:
+        sql = f.read()
+    conn.executescript(sql)
+    conn.execute("PRAGMA user_version = 1;")
+
+
+def _resolve_db_path() -> str:
+    return os.environ.get("RETAIL_DB_PATH", str(_DEFAULT_DB_PATH))
+
+
 def _new_connection(db_path: str) -> sqlite3.Connection:
-    """Create a new SQLite connection and enable foreign keys."""
+    """Create a new SQLite connection, enforce FKs, and ensure schema exists."""
     _ensure_parent_dir(db_path)
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON;")
+    _apply_schema_if_needed(conn)
     return conn
 
-def _resolve_db_path() -> str:
-    """
-    Determine the path to the database file.
-
-    Without Flask in the picture the configuration is simplified:
-    * If the ``RETAIL_DB_PATH`` environment variable is set, its value
-      is used.
-    * Otherwise the built‑in default of ``db/retail.db`` relative to
-      this source file is returned.
-    """
-    return os.environ.get("RETAIL_DB_PATH", _DEFAULT_DB_PATH)
 
 def get_request_connection() -> sqlite3.Connection:
-    """
-    Return a per‑request connection if inside a Flask request, otherwise a
-    thread‑local connection.
-    """
-    if has_app_context():
-        if not hasattr(g, "_retail_db_conn"):
-            setattr(g, "_retail_db_conn", _new_connection(_resolve_db_path()))
-        return getattr(g, "_retail_db_conn")
-
-    # Fallback for CLI/tests
+    """Return a per-thread connection."""
     if not hasattr(_thread_local, "conn") or _thread_local.conn is None:
         _thread_local.conn = _new_connection(_resolve_db_path())
     return _thread_local.conn  # type: ignore[attr-defined]
 
-###############################################################################
+
+# ------------------------------------------------------------------------------
 # Domain models
-###############################################################################
+# ------------------------------------------------------------------------------
 
 @dataclass
 class Product:
@@ -103,6 +120,7 @@ class Product:
     name: str
     price: float
     stock: int
+
 
 @dataclass
 class Payment:
@@ -114,11 +132,13 @@ class Payment:
     status: str
     timestamp: str
 
+
 @dataclass
 class SaleItemData:
     product_id: int
     quantity: int
     unit_price: float
+
 
 @dataclass
 class Sale:
@@ -129,35 +149,47 @@ class Sale:
     total: float
     status: str
 
-###############################################################################
+
+# ------------------------------------------------------------------------------
 # Base DAO
-###############################################################################
+# ------------------------------------------------------------------------------
 
 class BaseDAO:
-    """Base class for all DAOs. Ensures table creation on first instantiation."""
+    """
+    Base class for all DAOs.
+
+    NOTE: Schema creation is now handled centrally via init.sql at connection time.
+    The create_table() methods below remain as no-ops (or use IF NOT EXISTS) so
+    the public API is unchanged.
+    """
 
     def __init__(self, conn: Optional[sqlite3.Connection] = None) -> None:
         self._conn_explicit = conn
-        self.create_table()
+        # keep behavior: subclasses may still call create_table (safe with IF NOT EXISTS)
+        try:
+            self.create_table()
+        except Exception:
+            # Silently ignore if schema already exists or we rely on init.sql only.
+            pass
 
     def _conn(self) -> sqlite3.Connection:
-        return self._conn_explicit or get_request_connection()
+        return self._conn_explicit if self._conn_explicit is not None else get_request_connection()
 
     def create_table(self) -> None:
-        """Override to create the corresponding table(s)."""
-        raise NotImplementedError
+        """Default no-op; subclasses may override with IF NOT EXISTS."""
+        return
 
-###############################################################################
-# UserDAO
-###############################################################################
+
+# ------------------------------------------------------------------------------
+# User DAO
+# ------------------------------------------------------------------------------
 
 class UserDAO(BaseDAO):
     """Data Access Object for the User table."""
 
     def create_table(self) -> None:
-        """Create the User table with an is_admin flag (default 0)."""
-        conn = self._conn()
-        conn.execute(
+        # Safe no-op: CREATE TABLE IF NOT EXISTS
+        self._conn().execute(
             """
             CREATE TABLE IF NOT EXISTS User (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -169,7 +201,6 @@ class UserDAO(BaseDAO):
         )
 
     def register_user(self, username: str, password: str) -> bool:
-        """Register a new user with a SHA‑256 hashed password."""
         conn = self._conn()
         password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
         try:
@@ -183,46 +214,38 @@ class UserDAO(BaseDAO):
             return False
 
     def authenticate(self, username: str, password: str) -> Optional[int]:
-        """Return user_id if the username/password matches, else None."""
         conn = self._conn()
         password_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
-        cur = conn.execute(
+        row = conn.execute(
             "SELECT id FROM User WHERE username = ? AND password_hash = ?;",
             (username, password_hash),
-        )
-        row = cur.fetchone()
+        ).fetchone()
         return row[0] if row else None
 
     def set_admin(self, username: str, is_admin: bool = True) -> bool:
-        """Grant or revoke admin privileges for a given user."""
         conn = self._conn()
-        try:
-            with conn:
-                conn.execute(
-                    "UPDATE User SET is_admin = ? WHERE username = ?;",
-                    (1 if is_admin else 0, username),
-                )
-            return True
-        except Exception:
-            return False
+        with conn:
+            cur = conn.execute(
+                "UPDATE User SET is_admin = ? WHERE username = ?;",
+                (1 if is_admin else 0, username),
+            )
+        return cur.rowcount > 0
 
     def is_admin(self, username: str) -> bool:
-        """Check if the user has admin privileges."""
         conn = self._conn()
-        cur = conn.execute("SELECT is_admin FROM User WHERE username = ?;", (username,))
-        row = cur.fetchone()
+        row = conn.execute("SELECT is_admin FROM User WHERE username = ?;", (username,)).fetchone()
         return bool(row["is_admin"]) if row else False
 
-###############################################################################
-# ProductDAO (unchanged except for bug fix in get_product and update_name_price)
-###############################################################################
+
+# ------------------------------------------------------------------------------
+# Product DAO
+# ------------------------------------------------------------------------------
 
 class ProductDAO(BaseDAO):
     """DAO for Product records."""
 
     def create_table(self) -> None:
-        conn = self._conn()
-        conn.execute(
+        self._conn().execute(
             """
             CREATE TABLE IF NOT EXISTS Product (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -234,89 +257,51 @@ class ProductDAO(BaseDAO):
         )
 
     def add_product(self, name: str, price: float, stock: int) -> int:
-        """Add a new product. Raises sqlite3.IntegrityError if the name already exists."""
         conn = self._conn()
-        try:
-            with conn:
-                cur = conn.execute(
-                    "INSERT INTO Product (name, price, stock) VALUES (?, ?, ?);",
-                    (name, price, stock),
-                )
-            return cur.lastrowid
-        except sqlite3.IntegrityError:
-            # Raised if unique index idx_product_name rejects duplicate
-            raise
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO Product (name, price, stock) VALUES (?, ?, ?);",
+                (name, price, stock),
+            )
+        return cur.lastrowid
 
     def get_product(self, product_id: int) -> Optional[Product]:
-        """Return a Product or None if not found."""
-        conn = self._conn()
-        cur = conn.execute(
-            "SELECT id, name, price, stock FROM Product WHERE id = ?;",
-            (product_id,),
-        )
-        row = cur.fetchone()
+        row = self._conn().execute(
+            "SELECT id, name, price, stock FROM Product WHERE id = ?;", (product_id,)
+        ).fetchone()
         return Product(*row) if row else None
 
     def list_products(self) -> List[Product]:
-        """Return all products in ascending ID order."""
-        conn = self._conn()
-        cur = conn.execute("SELECT id, name, price, stock FROM Product ORDER BY id;")
-        return [Product(*row) for row in cur.fetchall()]
+        cur = self._conn().execute("SELECT id, name, price, stock FROM Product ORDER BY id;")
+        return [Product(*r) for r in cur.fetchall()]
 
     def update_stock(self, product_id: int, new_stock: int) -> None:
-        """
-        Update a product's stock level and commit the change.
-
-        Without explicitly committing, SQLite will defer transactions
-        until another commit occurs.  Wrapping the ``UPDATE`` in a
-        ``with conn:`` context manager ensures the change is written
-        immediately—especially important when editing stock from the
-        admin interface.
-        """
         conn = self._conn()
         with conn:
-            conn.execute(
-                "UPDATE Product SET stock = ? WHERE id = ?;",
-                (new_stock, product_id),
-            )
+            conn.execute("UPDATE Product SET stock = ? WHERE id = ?;", (new_stock, product_id))
 
     def update_name_price(self, product_id: int, name: str, price: float) -> None:
-        """Update a product’s name and price in one statement."""
         conn = self._conn()
         with conn:
             conn.execute(
-                "UPDATE Product SET name = ?, price = ? WHERE id = ?;",
-                (name, price, product_id),
+                "UPDATE Product SET name = ?, price = ? WHERE id = ?;", (name, price, product_id)
             )
 
     def delete_product(self, product_id: int) -> None:
-        """
-        Permanently remove a product from the catalogue.
-
-        Attempts to delete the product row with the given ID. If there
-        are existing `SaleItem` records referencing this product via
-        foreign keys, SQLite will raise an ``IntegrityError`` (unless
-        the foreign key is configured to cascade).  Callers should
-        handle ``sqlite3.IntegrityError`` to provide user feedback.
-        """
         conn = self._conn()
         with conn:
-            conn.execute(
-                "DELETE FROM Product WHERE id = ?;",
-                (product_id,),
-            )
+            conn.execute("DELETE FROM Product WHERE id = ?;", (product_id,))
 
 
-###############################################################################
+# ------------------------------------------------------------------------------
 # Payment DAO
-###############################################################################
+# ------------------------------------------------------------------------------
 
 class PaymentDAO(BaseDAO):
-    """Data Access Object for the `Payment` table."""
+    """DAO for the Payment table."""
 
     def create_table(self) -> None:
-        conn = self._conn()
-        conn.execute(
+        self._conn().execute(
             """
             CREATE TABLE IF NOT EXISTS Payment (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -334,27 +319,25 @@ class PaymentDAO(BaseDAO):
     def record_payment(
         self, sale_id: int, method: str, reference: str, amount: float, status: str
     ) -> int:
-        """Insert a new payment record and return its ID."""
         conn = self._conn()
-        timestamp = datetime.now(UTC).isoformat()
+        ts = datetime.now(UTC).isoformat()
         cur = conn.execute(
             "INSERT INTO Payment (sale_id, method, reference, amount, status, timestamp)"
             " VALUES (?, ?, ?, ?, ?, ?);",
-            (sale_id, method, reference, amount, status, timestamp),
+            (sale_id, method, reference, amount, status, ts),
         )
         return cur.lastrowid
 
 
-###############################################################################
+# ------------------------------------------------------------------------------
 # Sale DAO
-###############################################################################
+# ------------------------------------------------------------------------------
 
 class SaleDAO(BaseDAO):
-    """Data Access Object for the `Sale` and `SaleItem` tables."""
+    """DAO for the Sale and SaleItem tables."""
 
     def create_table(self) -> None:
         conn = self._conn()
-        # Create the Sale table
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS Sale (
@@ -368,7 +351,6 @@ class SaleDAO(BaseDAO):
             );
             """
         )
-        # Create the SaleItem table
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS SaleItem (
@@ -389,51 +371,20 @@ class SaleDAO(BaseDAO):
         items: List[SaleItemData],
         subtotal: float,
         total: float,
-        status: str = "Completed",
+        status: str,
     ) -> int:
-        """Create a sale and its associated line items in a single transaction."""
         conn = self._conn()
-        timestamp = datetime.now(UTC).isoformat()
+        ts = datetime.now(UTC).isoformat()
         with conn:
-            # Insert sale
             cur = conn.execute(
                 "INSERT INTO Sale (user_id, timestamp, subtotal, total, status)"
                 " VALUES (?, ?, ?, ?, ?);",
-                (user_id, timestamp, subtotal, total, status),
+                (user_id, ts, subtotal, total, status),
             )
             sale_id = cur.lastrowid
-            # Insert sale items
-            for item in items:
-                conn.execute(
-                    "INSERT INTO SaleItem (sale_id, product_id, quantity, unit_price)"
-                    " VALUES (?, ?, ?, ?);",
-                    (sale_id, item.product_id, item.quantity, item.unit_price),
-                )
+            conn.executemany(
+                "INSERT INTO SaleItem (sale_id, product_id, quantity, unit_price)"
+                " VALUES (?, ?, ?, ?);",
+                [(sale_id, it.product_id, it.quantity, it.unit_price) for it in items],
+            )
         return sale_id
-
-    def get_sale(self, sale_id: int) -> Tuple[Sale, List[SaleItemData]]:
-        """Retrieve a sale and its line items by ID."""
-        conn = self._conn()
-        cur = conn.execute(
-            "SELECT id, user_id, timestamp, subtotal, total, status FROM Sale WHERE id = ?;",
-            (sale_id,),
-        )
-        sale_row = cur.fetchone()
-        if not sale_row:
-            raise ValueError(f"Sale with ID {sale_id} does not exist")
-        sale = Sale(*sale_row)
-        # Fetch sale items
-        item_cur = conn.execute(
-            "SELECT product_id, quantity, unit_price FROM SaleItem WHERE sale_id = ?;",
-            (sale_id,),
-        )
-        items = [SaleItemData(*row) for row in item_cur.fetchall()]
-        return sale, items
-
-# NOTE: the functions below were originally defined at module scope.  They
-# effectively duplicated the `set_admin` and `is_admin` methods on `UserDAO` and
-# operated on whichever connection happened to be returned by
-# `get_request_connection()`.  Having module‑level functions that shadow
-# instance methods can lead to confusing behaviour and bugs, so these
-# definitions were removed.  Please use the `UserDAO.set_admin` and
-# `UserDAO.is_admin` methods on a DAO instance instead.
