@@ -1,128 +1,110 @@
 # Retail Store Application – Software Architecture Project
 
-This repository contains a **minimal retail application** built as part of a software architecture course. The goal of this checkpoint is to demonstrate how to structure a **two-tier system** (client + database) using **Python’s standard library only**. It provides a simple web interface for managing a product catalogue, registering/logging in users, adding items to a cart, and checking out. All data is stored locally in an SQLite database and the persistence layer is abstracted via Data Access Objects (DAOs).
+This repository contains a minimal retail application built as part of a software architecture course. The goal of this project checkpoint is to demonstrate how to structure a two-tier system (client + database) using Python’s standard library only. It provides a simple web interface for managing a product catalogue, registering/logging in users, adding items to a cart, and checking out. All data is stored locally in an SQLite database, and the persistence layer is abstracted via Data Access Objects (DAOs).
 
 ## Team Members
-Replace these with your actual names (two teammates required):
-- Team Member 1: **Kwabena Sekyi-Djan**
-- Team Member 2: **Jiacheng Xia**
+
+This project was completed by the following team members:  
+- Kwabena Sekyi-Djan  
+- Jiacheng Xia
 
 ## Project Structure
-.
-├── db/
-│ ├── init.sql # SQL script defining the database schema
-│ └── retail.db # SQLite database file (auto-generated at runtime; not tracked)
-├── docs/
-│ ├── UML/ # UML diagrams for the 4+1 views model
-│ └── ADR/ # Architecture Decision Records
-├── src/
-│ ├── app.py # Business logic: registration, cart, checkout
-│ ├── app_web.py # Minimal HTTP server using stdlib http.server
-│ ├── dao.py # DAOs for User, Product, Sale, SaleItem, Payment
-│ └── payment_service.py# Mock payment service (Card=approve, Cash=fail)
-├── tests/
-│ └── test_retail_app.py# Unit tests (business logic + DB integration)
-├── .gitignore
-└── README.md
 
-markdown
-Copy code
+```text
+.  
+├── db/  
+│   ├── init.sql          # SQL script defining the database schema  
+│   └── retail.db         # SQLite database file (auto-generated at runtime; should be ignored via version control)  
+├── docs/  
+│   ├── UML/              # UML diagrams for the 4+1 views model  
+│   └── ADR/              # Architecture Decision Records  
+├── src/  
+│   ├── app.py            # Business logic for registration, cart management, and checkout  
+│   ├── app_web.py        # Minimal HTTP server using Python’s built-in http.server module  
+│   ├── dao.py            # Data Access Objects for User, Product, Sale, SaleItem, and Payment  
+│   └── payment_service.py # Mock payment gateway  
+├── tests/                # Unit tests (business logic and DB integration)  
+│   └── test_retail_app.py # Test cases for the application  
+├── .gitignore            # Ignore patterns for Git (includes db/retail.db)  
+└── README.md             # Project documentation (this file)  
 
-> **Note:** `db/retail.db` is generated at runtime and should be ignored by Git (see `.gitignore`).
 
-## Prerequisites
-- **Python 3.10+**
-- Ability to create a virtual environment with **venv** (bundled with Python)
-- **No external dependencies required** (pure stdlib)
-- Optional: `sqlite3` **CLI** if you want to run `init.sql` manually. (The Python **`sqlite3` module** is included with Python; the **CLI** may not be installed on all systems.)
+Prerequisites
 
-## Setup
-```bash
-# clone & enter project
+Python 3.10+ installed on your machine.
+
+Ability to create a virtual environment with venv (built into Python).
+
+SQLite (comes with Python’s standard library; no separate installation needed).
+
+Setup Instructions
+
+Clone the repository and navigate into the project folder:
+
 git clone https://github.com/fhgggtyf/Software-Architecture-Project.git
 cd Software-Architecture-Project
 
-# create & activate virtual environment
+Create and activate a virtual environment. This isolates dependencies from your system Python:
+
 python3 -m venv .venv
-# macOS/Linux
-source .venv/bin/activate
-# Windows (PowerShell)
-# .venv\Scripts\Activate.ps1
+source .venv/bin/activate  # On Windows use `.venv\Scripts\activate`
+
+
 Database Setup
-The app uses SQLite at db/retail.db. The schema is defined in db/init.sql.
 
-Automatic: You do not need to run anything manually. On the first DB connection, the DAO layer executes db/init.sql and creates tables if they don’t exist.
+The application uses an SQLite database stored in db/retail.db. A schema definition is provided in db/init.sql. You do not need to run this manually—the DAO layer will automatically run the script on first connection and create the tables if they do not already exist. If you prefer to initialise the database manually (for example via the SQLite CLI), run:
 
-Manual (optional): If you have the SQLite CLI:
-
-bash
-Copy code
 sqlite3 db/retail.db < db/init.sql
-Override DB location: Set RETAIL_DB_PATH before running:
 
-bash
-Copy code
-RETAIL_DB_PATH=/absolute/path/to/retail.db python src/app_web.py
+
+You can override the default database path by setting the RETAIL_DB_PATH environment variable before starting the server.
+
 Running the Application
-Start the minimal HTTP server from the project root:
 
-bash
-Copy code
-# default: http://localhost:8000
-python src/app_web.py
+Start the minimal HTTP server from the project root. By default it listens on localhost:8000 but you can change the host and port via environment variables:
+
+# start the server on http://localhost:8000
+python ./src/app_web.py
 
 # or specify a different host/port
-HOST=0.0.0.0 PORT=8080 python src/app_web.py
-Open your browser to the server URL. You can then:
+HOST=0.0.0.0 PORT=8080 python ./src/app_web.py
 
-Register a user and log in
 
-Browse products, add to cart
+Open your browser and navigate to the server URL. You can then register a user, log in, browse products, add items to your cart, and check out. Upon checkout the application will:
 
-Checkout with a payment method
+Validate product IDs and stock levels.
 
-On checkout the app will:
+Compute subtotals and totals.
 
-Validate product IDs and stock levels
+Process a payment via the mock PaymentService (Card always succeeds; Cash always fails).
 
-Compute subtotals and totals
+Persist the sale, sale items and payment details atomically.
 
-Process payment via the mock PaymentService (Card always succeeds; Cash always fails)
+Decrement stock levels.
 
-Persist the sale, items, and payment details atomically
+Display a simple receipt.
 
-Decrement stock levels
+All data persists across restarts because it is stored in db/retail.db.
 
-Display a simple receipt
+Running the Tests
 
-All data persists across restarts in db/retail.db.
+This project includes a suite of unit tests covering both the business logic and the database integration. To run the tests, execute from the project root:
 
-Running Tests
-This project uses Python’s built-in unittest (no pytest required):
-
-bash
-Copy code
 python -m unittest discover -s tests -p "test_*.py" -v
-The tests use a temporary SQLite file (by setting RETAIL_DB_PATH) so they won’t interfere with your development database. They verify:
 
-Registration/login, cart behaviour, totals
 
-Checkout success (Card) and failure (Cash)
-
-Stock decrementation
-
-Payment persistence
-
-Foreign-key integrity
+The tests use a temporary SQLite database (RETAIL_DB_PATH is set to a temporary file) so they will not interfere with your development database. They verify registration/login, cart behaviour, checkout success/failure, stock decrementation, payment persistence, and foreign‑key integrity.
 
 Documentation
-UML (4+1 views): see docs/UML/ (logical/class, process/sequence, deployment, implementation, use-case)
 
-ADRs: see docs/ADR/ (e.g., DB choice, DAO pattern, mock payment approach)
+UML diagrams for the 4+1 views (logical, process, deployment, implementation and use‑case) are located under docs/UML/.
 
-Consolidated PDF: include a single PDF in docs/ with the UML diagrams, ADRs, and a link to the demo video (per checkpoint deliverables).
+Architectural Decision Records (ADRs) documenting key decisions (e.g., database choice, DAO pattern, mock payment service) reside in docs/ADR/.
 
-Notes
-The mock payment service is intentionally simple so you can demonstrate both success and failure flows.
+A consolidated PDF containing the diagrams, ADRs and a link to the demonstration is placed in the docs folder.
 
-The test suite sticks to stdlib unittest to remain dependency-free.
+Additional Notes
+
+The mock payment service is intentionally simple; it always approves card payments and rejects cash payments to allow you to demonstrate success and failure flows.
+
+The test suite uses Python’s built‑in unittest rather than pytest to remain dependency‑free.
