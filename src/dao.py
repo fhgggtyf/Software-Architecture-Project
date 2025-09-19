@@ -26,6 +26,7 @@ import sqlite3
 import threading
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
+from datetime import datetime, UTC
 
 # In the original implementation this module attempted to import
 # ``flask.g`` and related functions in order to maintain a per‑request
@@ -335,7 +336,7 @@ class PaymentDAO(BaseDAO):
     ) -> int:
         """Insert a new payment record and return its ID."""
         conn = self._conn()
-        timestamp = datetime.datetime.utcnow().isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         cur = conn.execute(
             "INSERT INTO Payment (sale_id, method, reference, amount, status, timestamp)"
             " VALUES (?, ?, ?, ?, ?, ?);",
@@ -392,7 +393,7 @@ class SaleDAO(BaseDAO):
     ) -> int:
         """Create a sale and its associated line items in a single transaction."""
         conn = self._conn()
-        timestamp = datetime.datetime.utcnow().isoformat()
+        timestamp = datetime.now(UTC).isoformat()
         with conn:
             # Insert sale
             cur = conn.execute(

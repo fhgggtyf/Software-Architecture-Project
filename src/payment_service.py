@@ -13,7 +13,7 @@ to swap in a real implementation if desired.
 import datetime
 import random
 from typing import Tuple
-
+from datetime import datetime, UTC
 
 class PaymentService:
     """Simplified payment service that simulates approval or rejection."""
@@ -50,13 +50,13 @@ class PaymentService:
             return False, "Cash payments are currently not accepted"
         if method_lower == "card":
             # Always succeed card payments
-            ref = f"TXN-{int(datetime.datetime.utcnow().timestamp()*1000)}"
+            ref = f"TXN-{int(datetime.now(UTC).timestamp() * 1000)}"
             return True, ref
         # For other methods, defer to the always_approve flag
         if self.always_approve:
-            ref = f"TXN-{int(datetime.datetime.utcnow().timestamp()*1000)}"
+            ref = f"TXN-{int(datetime.now(UTC).timestamp() * 1000)}"
             return True, ref
         else:
             success = random.choice([True, False])
-            ref = f"TXN-{int(datetime.datetime.utcnow().timestamp()*1000)}"
+            ref = f"TXN-{int(datetime.now(UTC).timestamp() * 1000)}"
             return success, ref
