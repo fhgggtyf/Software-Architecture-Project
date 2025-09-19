@@ -28,40 +28,50 @@ This project was completed by the following team members:
 ├── .gitignore            # Ignore patterns for Git (includes db/retail.db)  
 └── README.md             # Project documentation (this file)  
 
+```
 
-Prerequisites
+## Prerequisites
+- Python 3.10+ installed on your machine.
+- Ability to create a virtual environment with venv (built into Python).
+- SQLite (comes with Python’s standard library; no separate installation needed).
 
-Python 3.10+ installed on your machine.
+## Setup Instructions
 
-Ability to create a virtual environment with venv (built into Python).
+- Clone the repository and navigate into the project folder:
 
-SQLite (comes with Python’s standard library; no separate installation needed).
-
-Setup Instructions
-
-Clone the repository and navigate into the project folder:
+```text
 
 git clone https://github.com/fhgggtyf/Software-Architecture-Project.git
 cd Software-Architecture-Project
 
-Create and activate a virtual environment. This isolates dependencies from your system Python:
+```
+
+- Create and activate a virtual environment. This isolates dependencies from your system Python:
+
+```text
 
 python3 -m venv .venv
 source .venv/bin/activate  # On Windows use `.venv\Scripts\activate`
 
+```
 
-Database Setup
+- Database Setup
 
 The application uses an SQLite database stored in db/retail.db. A schema definition is provided in db/init.sql. You do not need to run this manually—the DAO layer will automatically run the script on first connection and create the tables if they do not already exist. If you prefer to initialise the database manually (for example via the SQLite CLI), run:
 
+```text
+
 sqlite3 db/retail.db < db/init.sql
 
+```
 
 You can override the default database path by setting the RETAIL_DB_PATH environment variable before starting the server.
 
-Running the Application
+- Running the Application
 
 Start the minimal HTTP server from the project root. By default it listens on localhost:8000 but you can change the host and port via environment variables:
+
+```text
 
 # start the server on http://localhost:8000
 python ./src/app_web.py
@@ -69,10 +79,11 @@ python ./src/app_web.py
 # or specify a different host/port
 HOST=0.0.0.0 PORT=8080 python ./src/app_web.py
 
+```
 
 Open your browser and navigate to the server URL. You can then register a user, log in, browse products, add items to your cart, and check out. Upon checkout the application will:
 
-Validate product IDs and stock levels.
+- Validate product IDs and stock levels.
 
 Compute subtotals and totals.
 
