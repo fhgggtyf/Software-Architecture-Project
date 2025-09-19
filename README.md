@@ -67,6 +67,8 @@ sqlite3 db/retail.db < db/init.sql
 
 You can override the default database path by setting the RETAIL_DB_PATH environment variable before starting the server.
 
+Note that it’s ignored by .gitignore and should not be committed.
+
 ### Running the Application
 
 Start the minimal HTTP server from the project root. By default it listens on localhost:8000 but you can change the host and port via environment variables:
@@ -81,21 +83,27 @@ HOST=0.0.0.0 PORT=8080 python ./src/app_web.py
 
 ```
 
-Open your browser and navigate to the server URL. You can then register a user, log in, browse products, add items to your cart, and check out. Upon checkout the application will:
+#### Purchase Flow (Register a Sale)
 
-- Validate product IDs and stock levels.
+When a user checks out, the application performs the required steps:
 
-- Compute subtotals and totals.
+- Validate product IDs and stock levels
 
-- Process a payment via the mock PaymentService (Card always succeeds; Cash always fails).
+- Compute subtotals and totals
 
-- Persist the sale, sale items and payment details atomically.
+- Process payment via the mock PaymentService
 
-- Decrement stock levels.
+- Card payments always succeed
 
-- Display a simple receipt.
+- Cash payments always fail
 
-- All data persists across restarts because it is stored in db/retail.db.
+- Persist the sale, items, and payment details atomically
+
+- Decrement stock levels
+
+- Display a simple receipt
+
+All data is persisted in db/retail.db.
 
 ## Running the Tests
 
@@ -115,10 +123,10 @@ UML diagrams for the 4+1 views (logical, process, deployment, implementation and
 
 Architectural Decision Records (ADRs) documenting key decisions (e.g., database choice, DAO pattern, mock payment service) reside in docs/ADR/.
 
-A consolidated PDF containing the diagrams, ADRs and a link to the demonstration is placed in the docs folder.
+A consolidated PDF including UML diagrams, ADRs, and the demo video link is included in the docs/ folder.
 
 ## Additional Notes
 
 The mock payment service is intentionally simple; it always approves card payments and rejects cash payments to allow you to demonstrate success and failure flows.
 
-The test suite uses Python’s built‑in unittest rather than pytest to remain dependency‑free.
+Although the spec mentions pytest, this repo uses Python’s built-in unittest to remain dependency-free.
