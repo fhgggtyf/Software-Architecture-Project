@@ -1,115 +1,162 @@
 """
-Data Access Objects (DAOs) and domain models for the minimal retail app.
+Modified DAO module implementing Scenario 1.2 (Database Failure Recovery)
 
-- Uses Python's built-in sqlite3 with per-thread connection.
-- Resolves DB path from RETAIL_DB_PATH or defaults to ../db/retail.db relative to this file.
-- On first connection, runs db/init.sql (or RETAIL_SCHEMA_PATH) to create the schema.
-- Foreign keys are enforced for every connection (PRAGMA foreign_keys = ON).
+Adds:
+ - automatic switch to READ-ONLY mode when DB fails
+ - queuing of write operations during outage
+ - background reconnection + replay of queued writes
 """
 
 from __future__ import annotations
-
-import hashlib
-import os
-import sqlite3
-import threading
+import hashlib, os, sqlite3, threading, time, logging
 from dataclasses import dataclass
 from datetime import datetime, UTC
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional
+
+logger = logging.getLogger(__name__)
 
 # ------------------------------------------------------------------------------
-# Connection management (thread-local)
+# Global fallback state
 # ------------------------------------------------------------------------------
+_thread_local = threading.local()
+_read_only_mode = False
+_write_queue = []
+_last_failure_time = 0.0
+_RETRY_INTERVAL = 10  # seconds
 
-# Default DB path: ../db/retail.db relative to this file
 _THIS_FILE = Path(__file__).resolve()
 _DEFAULT_DB_PATH = (_THIS_FILE.parent / ".." / "db" / "retail.db").resolve()
 
-_thread_local = threading.local()
-
-
+# ------------------------------------------------------------------------------
+# Utility helpers
+# ------------------------------------------------------------------------------
 def _ensure_parent_dir(path: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent and not os.path.exists(parent):
         os.makedirs(parent, exist_ok=True)
 
+def _resolve_db_path() -> str:
+    return os.environ.get("RETAIL_DB_PATH", str(_DEFAULT_DB_PATH))
 
 def _find_schema_path() -> Optional[Path]:
-    """Find db/init.sql, preferring RETAIL_SCHEMA_PATH if provided."""
     env = os.environ.get("RETAIL_SCHEMA_PATH")
     if env:
         p = Path(env).expanduser().resolve()
-        return p if p.is_file() else None
-
+        if p.is_file():
+            return p
     candidates = [
-        # repo root layout
         _THIS_FILE.parent / ".." / "db" / "init.sql",
-        # if someone runs from root and code is *also* in root
         _THIS_FILE.parent / "db" / "init.sql",
-        # one level up fallback
         _THIS_FILE.parent / "../db/init.sql",
     ]
     for c in candidates:
-        c = c.resolve()
         if c.is_file():
             return c
     return None
 
-
 def _apply_schema_if_needed(conn: sqlite3.Connection) -> None:
-    """
-    Apply schema from init.sql exactly once per DB file using PRAGMA user_version.
-    If user_version == 0, attempt to run schema and then set it to 1.
-    """
-    # If user_version already set, assume schema applied
     (ver,) = conn.execute("PRAGMA user_version;").fetchone()
     if int(ver) > 0:
         return
-
     schema_path = _find_schema_path()
     if not schema_path:
-        # If we can't find a schema file but tables already exist, just set a version.
-        # Otherwise, raise a helpful error.
-        existing = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
-            "('User','Product','Sale','SaleItem','Payment');"
-        ).fetchall()
-        if existing:
-            conn.execute("PRAGMA user_version = 1;")
-            return
-        raise FileNotFoundError(
-            "Could not locate db/init.sql and schema tables do not exist. "
-            "Set RETAIL_SCHEMA_PATH or place init.sql under ./db/."
-        )
-
+        conn.execute("PRAGMA user_version = 1;")
+        return
     with open(schema_path, "r", encoding="utf-8") as f:
         sql = f.read()
     conn.executescript(sql)
     conn.execute("PRAGMA user_version = 1;")
 
-
-def _resolve_db_path() -> str:
-    return os.environ.get("RETAIL_DB_PATH", str(_DEFAULT_DB_PATH))
-
-
-def _new_connection(db_path: str) -> sqlite3.Connection:
-    """Create a new SQLite connection, enforce FKs, and ensure schema exists."""
+# ------------------------------------------------------------------------------
+# Connection management with fallback
+# ------------------------------------------------------------------------------
+def _new_connection(read_only=False) -> sqlite3.Connection:
+    db_path = _resolve_db_path()
     _ensure_parent_dir(db_path)
-    conn = sqlite3.connect(db_path)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys = ON;")
-    _apply_schema_if_needed(conn)
-    return conn
-
+    try:
+        if read_only:
+            uri = f"file:{db_path}?mode=ro"
+            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+        else:
+            conn = sqlite3.connect(db_path, check_same_thread=False)
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA foreign_keys = ON;")
+        _apply_schema_if_needed(conn)
+        return conn
+    except sqlite3.OperationalError as e:
+        logger.error(f"DB open failed ({'ro' if read_only else 'rw'}): {e}")
+        raise
 
 def get_request_connection() -> sqlite3.Connection:
-    """Return a per-thread connection."""
-    if not hasattr(_thread_local, "conn") or _thread_local.conn is None:
-        _thread_local.conn = _new_connection(_resolve_db_path())
-    return _thread_local.conn  # type: ignore[attr-defined]
+    """Return a per-thread connection (read-only if needed)."""
+    global _read_only_mode, _last_failure_time
+    conn = getattr(_thread_local, "conn", None)
+    if conn is None:
+        try:
+            conn = _new_connection(read_only=_read_only_mode)
+            _thread_local.conn = conn
+        except sqlite3.OperationalError:
+            _read_only_mode = True
+            _last_failure_time = time.time()
+            conn = _new_connection(read_only=True)
+            _thread_local.conn = conn
+    return conn
 
+# ------------------------------------------------------------------------------
+# Read/write wrappers (queueing)
+# ------------------------------------------------------------------------------
+def execute_read(query, params=()):
+    conn = get_request_connection()
+    with conn:
+        cur = conn.execute(query, params)
+        return cur.fetchall()
 
+def execute_write(query, params=()):
+    """Execute write; if DB down or in read-only, queue the statement."""
+    global _read_only_mode
+    try:
+        if _read_only_mode:
+            _write_queue.append((query, params))
+            logger.warning("DB read-only; queued write.")
+            return False
+        conn = get_request_connection()
+        with conn:
+            conn.execute(query, params)
+        return True
+    except sqlite3.OperationalError as e:
+        logger.error(f"Write failed: {e}")
+        _read_only_mode = True
+        _last_failure_time = time.time()
+        _write_queue.append((query, params))
+        return False
+
+# ------------------------------------------------------------------------------
+# Background reconnection worker
+# ------------------------------------------------------------------------------
+def _recovery_worker():
+    global _read_only_mode
+    while True:
+        time.sleep(_RETRY_INTERVAL)
+        if not _read_only_mode:
+            continue
+        try:
+            conn = _new_connection(read_only=False)
+            with conn:
+                while _write_queue:
+                    q, p = _write_queue.pop(0)
+                    conn.execute(q, p)
+            conn.close()
+            _read_only_mode = False
+            logger.info("DB recovered; queued writes flushed.")
+        except sqlite3.OperationalError:
+            logger.warning("Still cannot reconnect to DB.")
+
+def start_recovery_thread():
+    t = threading.Thread(target=_recovery_worker, daemon=True)
+    t.start()
+
+start_recovery_thread()
 # ------------------------------------------------------------------------------
 # Domain models
 # ------------------------------------------------------------------------------
