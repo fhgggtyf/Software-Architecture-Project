@@ -22,7 +22,13 @@ CREATE TABLE IF NOT EXISTS Product (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     name TEXT NOT NULL,
     price REAL NOT NULL,
-    stock INTEGER NOT NULL CHECK (stock >= 0)
+    stock INTEGER NOT NULL CHECK (stock >= 0),
+    -- Optional flash sale fields.  When flash_sale_start and flash_sale_end
+    -- denote an active period and flash_sale_price is set, the product will
+    -- be sold at the discounted flash_sale_price instead of the regular price.
+    flash_sale_price REAL,
+    flash_sale_start TEXT,
+    flash_sale_end TEXT
 );
 
 -- Sales table records completed purchases

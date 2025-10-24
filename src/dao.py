@@ -120,6 +120,12 @@ class Product:
     name: str
     price: float
     stock: int
+    # Optional flash sale fields.  If flash_sale_start and flash_sale_end
+    # define a period encompassing the current time and flash_sale_price is
+    # defined, the product may be sold at flash_sale_price instead of price.
+    flash_sale_price: float | None = None
+    flash_sale_start: str | None = None
+    flash_sale_end: str | None = None
 
 
 @dataclass
@@ -251,34 +257,118 @@ class ProductDAO(BaseDAO):
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
                 price REAL NOT NULL,
-                stock INTEGER NOT NULL CHECK (stock >= 0)
+                stock INTEGER NOT NULL CHECK (stock >= 0),
+                flash_sale_price REAL,
+                flash_sale_start TEXT,
+                flash_sale_end TEXT
             );
             """
         )
 
-    def add_product(self, name: str, price: float, stock: int) -> int:
+    def add_product(
+        self,
+        name: str,
+        price: float,
+        stock: int,
+        flash_sale_price: float | None = None,
+        flash_sale_start: str | None = None,
+        flash_sale_end: str | None = None,
+    ) -> int:
+        """
+        Add a new product.  Optional flash sale arguments may be supplied to
+        configure a discounted price and time window during which the discount
+        applies.  If omitted, the product will not have a flash sale.
+        """
         conn = self._conn()
         with conn:
             cur = conn.execute(
-                "INSERT INTO Product (name, price, stock) VALUES (?, ?, ?);",
-                (name, price, stock),
+                "INSERT INTO Product (name, price, stock, flash_sale_price, flash_sale_start, flash_sale_end) "
+                "VALUES (?, ?, ?, ?, ?, ?);",
+                (name, price, stock, flash_sale_price, flash_sale_start, flash_sale_end),
             )
         return cur.lastrowid
 
     def get_product(self, product_id: int) -> Optional[Product]:
         row = self._conn().execute(
-            "SELECT id, name, price, stock FROM Product WHERE id = ?;", (product_id,)
+            "SELECT id, name, price, stock, flash_sale_price, flash_sale_start, flash_sale_end "
+            "FROM Product WHERE id = ?;",
+            (product_id,),
         ).fetchone()
         return Product(*row) if row else None
 
     def list_products(self) -> List[Product]:
-        cur = self._conn().execute("SELECT id, name, price, stock FROM Product ORDER BY id;")
+        cur = self._conn().execute(
+            "SELECT id, name, price, stock, flash_sale_price, flash_sale_start, flash_sale_end FROM Product ORDER BY id;"
+        )
         return [Product(*r) for r in cur.fetchall()]
+
+    def get_product_by_name(self, name: str) -> Optional[Product]:
+        """Return the first product with the given name, or None if absent."""
+        row = self._conn().execute(
+            "SELECT id, name, price, stock, flash_sale_price, flash_sale_start, flash_sale_end "
+            "FROM Product WHERE name = ? ORDER BY id LIMIT 1;",
+            (name,),
+        ).fetchone()
+        return Product(*row) if row else None
+
+    def upsert_product(
+        self,
+        name: str,
+        price: float,
+        stock: int,
+        flash_sale_price: float | None = None,
+        flash_sale_start: str | None = None,
+        flash_sale_end: str | None = None,
+    ) -> int:
+        """
+        Insert or update a product based on its name.  If a product with the
+        given name exists, its price, stock, and flash sale attributes are
+        updated.  Otherwise, a new product is inserted.  Returns the product ID.
+        """
+        conn = self._conn()
+        existing = self.get_product_by_name(name)
+        if existing:
+            # Update existing product fields
+            with conn:
+                conn.execute(
+                    "UPDATE Product SET price = ?, stock = ?, flash_sale_price = ?, "
+                    "flash_sale_start = ?, flash_sale_end = ? WHERE id = ?;",
+                    (price, stock, flash_sale_price, flash_sale_start, flash_sale_end, existing.id),
+                )
+            return existing.id
+        else:
+            return self.add_product(name, price, stock, flash_sale_price, flash_sale_start, flash_sale_end)
 
     def update_stock(self, product_id: int, new_stock: int) -> None:
         conn = self._conn()
         with conn:
             conn.execute("UPDATE Product SET stock = ? WHERE id = ?;", (new_stock, product_id))
+
+    def decrease_stock_if_available(self, product_id: int, qty: int) -> bool:
+        """
+        Atomically decrease the stock for a product by ``qty`` only if enough
+        inventory is available.  Returns True if the stock was decremented,
+        False otherwise.  This method guards against race conditions in a
+        concurrent checkout scenario by using a conditional update and
+        inspecting the affected row count.
+
+        :param product_id: ID of the product to update
+        :param qty: Quantity to subtract from the current stock
+        :returns: True if the update succeeded, False if there was insufficient stock
+        """
+        if qty < 0:
+            raise ValueError("Quantity to decrease must be non-negative")
+        conn = self._conn()
+        # Use a single UPDATE statement with a WHERE clause that ensures the
+        # product has sufficient stock.  SQLite guarantees that changes are
+        # atomic within a transaction.  If stock would go negative, no rows
+        # will be updated and rowcount will be 0.
+        with conn:
+            cur = conn.execute(
+                "UPDATE Product SET stock = stock - ? WHERE id = ? AND stock >= ?;",
+                (qty, product_id, qty),
+            )
+        return cur.rowcount > 0
 
     def update_name_price(self, product_id: int, name: str, price: float) -> None:
         conn = self._conn()

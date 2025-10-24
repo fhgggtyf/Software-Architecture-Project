@@ -310,13 +310,44 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
         app: RetailApp = self.session["app"]  # type: ignore[assignment]
         products = app.list_products()
         rows = []
+        from datetime import datetime, UTC
         for p in products:
+            # Determine effective price based on flash sale
+            effective_price = p.price
+            on_sale = False
+            try:
+                if p.flash_sale_price is not None and p.flash_sale_start and p.flash_sale_end:
+                    start = datetime.fromisoformat(p.flash_sale_start)
+                    end = datetime.fromisoformat(p.flash_sale_end)
+                    now = datetime.now(UTC)
+                    if start.tzinfo is None:
+                        start = start.replace(tzinfo=UTC)
+                    if end.tzinfo is None:
+                        end = end.replace(tzinfo=UTC)
+                    if start <= now <= end:
+                        effective_price = p.flash_sale_price
+                        on_sale = True
+            except Exception:
+                pass
+            price_html = f"{effective_price:.2f}"
+            if on_sale:
+                price_html = (
+                    f"<span style='text-decoration:line-through;color:#777'>{p.price:.2f}</span> "
+                    f"<span style='color:#d00;font-weight:bold'>{p.flash_sale_price:.2f}</span>"
+                    f"<br><small>Sale: {p.flash_sale_start} → {p.flash_sale_end}</small>"
+                )
+            else:
+                price_html = f"{p.price:.2f}"
+
             row = (
-                f"<tr><td>{p.id}</td><td>{html_escape(p.name)}</td><td>{p.price:.2f}</td><td>{p.stock}</td>"
+                f"<tr><td>{p.id}</td><td>{html_escape(p.name)}</td><td>{price_html}</td><td>{p.stock}</td>"
                 "<td>"
                 f"<form method='post' action='/cart/add' style='display:inline'>"
                 f"<input type='hidden' name='product_id' value='{p.id}' />"
-                "<input type='number' name='quantity' min='1' value='1' style='width:4rem' />"
+                # Limit the quantity input to available stock so users cannot
+                # request more than what's in inventory.  HTML5 browsers will
+                # prevent submission if the value exceeds this maximum.
+                f"<input type='number' name='quantity' min='1' max='{p.stock}' value='1' style='width:4rem' />"
                 "<button type='submit'>Add</button></form>"
                 "</td></tr>"
             )
@@ -452,6 +483,7 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
     <select name='payment_method'>
       <option value='Card'>Card</option>
       <option value='Cash'>Cash</option>
+      <option value='Crypto'>Crypto</option>
     </select>
   </label><br><br>
   <button type='submit'>Pay</button>
@@ -602,10 +634,29 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         ok, res = app.checkout(method)
         if ok:
+            # Escape the plain-text receipt for HTML display
             receipt_html = html_escape(res).replace("\n", "<br>")
-            self._send_html(self._wrap_page("Receipt", f"<h1>Thank you for your purchase!</h1><p>{receipt_html}</p><p><a href='/products'>Continue shopping</a></p>"))
+            # Build a downloadable receipt: encode as URL-safe string
+            encoded = urllib.parse.quote(res)
+            download_link = (
+                f"<a href='data:text/plain;charset=utf-8,{encoded}' download='receipt.txt'>Download receipt</a>"
+            )
+            # Print button triggers browser print dialog
+            print_button = "<button onclick=\"window.print()\">Print receipt</button>"
+            body = (
+                f"<h1>Thank you for your purchase!</h1>"
+                f"<p>{receipt_html}</p>"
+                f"<p>{print_button} &nbsp; {download_link}</p>"
+                f"<p><a href='/products'>Continue shopping</a></p>"
+            )
+            self._send_html(self._wrap_page("Receipt", body))
         else:
-            self._send_html(self._wrap_page("Payment Failed", f"<p>Payment failed: {html_escape(res)}</p><p><a href='/cart'>Back to cart</a></p>"))
+            self._send_html(
+                self._wrap_page(
+                    "Payment Failed",
+                    f"<p>Payment failed: {html_escape(res)}</p><p><a href='/cart'>Back to cart</a></p>",
+                )
+            )
 
 
 def run_server(host: str = "localhost", port: int = 8000) -> None:
