@@ -275,18 +275,58 @@ class ProductDAO(BaseDAO):
         flash_sale_end: str | None = None,
     ) -> int:
         """
-        Add a new product.  Optional flash sale arguments may be supplied to
-        configure a discounted price and time window during which the discount
-        applies.  If omitted, the product will not have a flash sale.
+        Add or update a product:
+        - If same name & price & same sale window: increment stock.
+        - If same name & price but different sale window: update sale fields.
+        - Otherwise, insert a new product.
         """
         conn = self._conn()
         with conn:
+            # 1️⃣ Try to find a product with same name & price
             cur = conn.execute(
-                "INSERT INTO Product (name, price, stock, flash_sale_price, flash_sale_start, flash_sale_end) "
-                "VALUES (?, ?, ?, ?, ?, ?);",
+                "SELECT id, stock, flash_sale_start, flash_sale_end FROM Product WHERE name = ? AND price = ?",
+                (name, price),
+            )
+            existing = cur.fetchone()
+
+            if existing:
+                pid, current_stock, existing_start, existing_end = existing
+
+                # 2️⃣ If flash sale window is the same → restock
+                if (
+                    existing_start == flash_sale_start
+                    and existing_end == flash_sale_end
+                ):
+                    conn.execute(
+                        "UPDATE Product SET stock = ? WHERE id = ?",
+                        (current_stock + stock, pid),
+                    )
+                    return pid
+
+                # 3️⃣ Otherwise (different window) → update the sale info instead
+                conn.execute(
+                    """
+                    UPDATE Product
+                    SET flash_sale_price = ?,
+                        flash_sale_start = ?,
+                        flash_sale_end = ?,
+                        stock = stock + ?
+                    WHERE id = ?;
+                    """,
+                    (flash_sale_price, flash_sale_start, flash_sale_end, stock, pid),
+                )
+                return pid
+
+            # 4️⃣ No existing match — insert new product
+            cur = conn.execute(
+                """
+                INSERT INTO Product (name, price, stock, flash_sale_price, flash_sale_start, flash_sale_end)
+                VALUES (?, ?, ?, ?, ?, ?);
+                """,
                 (name, price, stock, flash_sale_price, flash_sale_start, flash_sale_end),
             )
-        return cur.lastrowid
+            return cur.lastrowid
+
 
     def get_product(self, product_id: int) -> Optional[Product]:
         row = self._conn().execute(

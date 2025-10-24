@@ -111,6 +111,19 @@ class JSONPartnerAdapter(PartnerAdapter):
                 p["flash_sale_end"] = str(row["flash_sale_end"])
             products.append(p)
         return products
+    
+class XMLPartnerAdapter(PartnerAdapter):
+    """Simple XML feed parser: <products><product>...</product></products>"""
+    def parse(self, data: str) -> list[dict[str, str]]:
+        import xml.etree.ElementTree as ET
+        root = ET.fromstring(data)
+        products = []
+        for p in root.findall(".//product"):
+            name = p.findtext("name") or "Unnamed"
+            price = float(p.findtext("price") or 0)
+            stock = int(p.findtext("stock") or 0)
+            products.append({"name": name, "price": price, "stock": stock})
+        return products
 
 
 def select_adapter(file_path: str) -> PartnerAdapter:
@@ -120,6 +133,8 @@ def select_adapter(file_path: str) -> PartnerAdapter:
         return CSVPartnerAdapter()
     if ext in {".json", ".jsn"}:
         return JSONPartnerAdapter()
+    if ext == ".xml":
+        return XMLPartnerAdapter()
     raise ValueError(f"Unsupported partner feed format: {ext}")
 
 

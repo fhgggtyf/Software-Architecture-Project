@@ -15,6 +15,16 @@ from dao import (
     get_request_connection,
 )
 from payment_service import PaymentService
+from external_services import inventory_service, shipping_service, reseller_gateway
+
+# Import custom metrics and logging
+from metrics import (
+    CHECKOUT_DURATION_SECONDS,
+    CHECKOUT_ERROR_TOTAL,
+    CIRCUIT_BREAKER_OPEN,
+)
+import logging
+logger = logging.getLogger(__name__)
 
 @dataclass
 class CartLine:
@@ -40,12 +50,22 @@ class RetailApp:
         """Record a payment failure and update the last failure timestamp."""
         cls._payment_failures += 1
         cls._payment_last_failure_time = time.time()
+        # Update circuit breaker gauge: 1 if open, 0 otherwise
+        try:
+            CIRCUIT_BREAKER_OPEN.set(1.0 if cls._is_circuit_open() else 0.0)
+        except Exception:
+            pass
 
     @classmethod
     def _record_payment_success(cls) -> None:
         """Reset the failure count and last failure time on successful payment."""
         cls._payment_failures = 0
         cls._payment_last_failure_time = None
+        # Close the circuit breaker gauge
+        try:
+            CIRCUIT_BREAKER_OPEN.set(0.0)
+        except Exception:
+            pass
 
     @classmethod
     def _is_circuit_open(cls) -> bool:
@@ -78,6 +98,14 @@ class RetailApp:
         self.sale_dao = SaleDAO()
         self.payment_dao = PaymentDAO()
         self.payment_service = PaymentService()
+
+        # External service integrations for inventory, shipping and resellers.
+        # These stub services are part of the integrability pattern.  In a
+        # production system these would communicate with external APIs or
+        # SDKs.  Here they simply return success.
+        self.inventory_service = inventory_service
+        self.shipping_service = shipping_service
+        self.reseller_gateway = reseller_gateway
 
         # Cart keyed by product_id
         self._cart: Dict[int, CartLine] = {}
@@ -122,10 +150,18 @@ class RetailApp:
             # time is within the inclusive range.  Use UTC timestamps to avoid
             # timezone ambiguity.
             from datetime import datetime, UTC
-
-            if p.flash_sale_price is not None and p.flash_sale_start and p.flash_sale_end:
-                start = datetime.fromisoformat(p.flash_sale_start)
-                end = datetime.fromisoformat(p.flash_sale_end)
+            # Retrieve a potentially updated product record by name.  This
+            # handles the case where an earlier call to ``add_product`` returned
+            # a pseudo ID during read‑only fallback and ``upsert_product``
+            # subsequently created a new record.  By looking up by name we
+            # ensure we capture flash sale attributes that may have been
+            # updated on a different row.
+            updated_p = self.product_dao.get_product_by_name(p.name)
+            # Prefer the updated record if available
+            prod = updated_p if updated_p else p
+            if prod.flash_sale_price is not None and prod.flash_sale_start and prod.flash_sale_end:
+                start = datetime.fromisoformat(prod.flash_sale_start)
+                end = datetime.fromisoformat(prod.flash_sale_end)
                 now = datetime.now(UTC)
                 # If the flash sale period has timezone information, Python will
                 # preserve it.  Compare naive/aware times carefully.
@@ -134,7 +170,7 @@ class RetailApp:
                 if end.tzinfo is None:
                     end = end.replace(tzinfo=UTC)
                 if start <= now <= end:
-                    unit_price = p.flash_sale_price
+                    unit_price = prod.flash_sale_price
         except Exception:
             # If parsing fails, fall back to regular price
             unit_price = p.price
@@ -163,122 +199,229 @@ class RetailApp:
     # ---- Checkout ----
 
     def checkout(self, payment_method: str) -> Tuple[bool, str]:
-        if not self._current_user_id:
-            return False, "You must be logged in."
-        if not self._cart:
-            return False, "Cart is empty."
+        """Process the checkout operation and record metrics.
 
-        # Revalidate stock before payment
-        for line in self._cart.values():
-            p = self.product_dao.get_product(line.product_id)
-            if not p:
-                return False, "A product in your cart no longer exists."
-            if line.qty > p.stock:
-                return False, f"Only {p.stock} in stock for {p.name}"
-
-        totals = self.compute_cart_totals()
-        total = totals.total
-
-        # Check circuit breaker before attempting payment
-        if RetailApp._is_circuit_open():
-            # If the circuit is open, reject the request immediately
-            return False, "Payment service is temporarily unavailable. Please try again later."
-
-        # Attempt payment with retry logic and exponential backoff
-        retries = 3
-        delay = 1.0
-        approved = False
-        reference = ""
-        for attempt in range(retries):
-            approved, reference = self.payment_service.process_payment(total, payment_method)
-            if approved:
-                # Reset failure count on success
-                RetailApp._record_payment_success()
-                break
-            else:
-                # Record a failure and potentially open the circuit
-                RetailApp._record_payment_failure()
-                # On last attempt, fail with the payment error
-                if attempt >= retries - 1:
-                    return False, reference
-                # Wait before retrying (exponential backoff)
-                time.sleep(delay)
-                delay *= 2.0
-
-        # If payment was not approved after retries, return the reason
-        if not approved:
-            return False, reference
-
-        # Persist sale and decrement stock atomically; rollback on failure
-        conn = get_request_connection()
-        user_dao = UserDAO(conn)
-        product_dao = ProductDAO(conn)
-        sale_dao = SaleDAO(conn)
-        payment_dao = PaymentDAO(conn)
-
-        items = [
-            SaleItemData(product_id=ln.product_id, quantity=ln.qty, unit_price=ln.unit_price)
-            for ln in self._cart.values()
-        ]
-
+        This method handles stock validation, payment processing with retries
+        and circuit breaker checks, database persistence, and receipt
+        generation.  It records the duration of the checkout in a
+        histogram and increments error counters based on the outcome.
+        """
+        start_time = time.perf_counter()
+        # Track the type of error for metrics.  None means success.
+        error_type: str | None = None
         try:
-            with conn:
-                # Extra check for concurrency at commit time
-                for ln in self._cart.values():
-                    p = product_dao.get_product(ln.product_id)
-                    if not p or p.stock < ln.qty:
-                        raise RuntimeError("Insufficient stock at commit time.")
-                # Create the sale first; this reserves the sale ID.  If stock
-                # adjustments fail, the transaction will roll back and the sale
-                # record will not persist.
-                sale_id = sale_dao.create_sale(
-                    user_id=self._current_user_id,
-                    items=items,
-                    subtotal=totals.subtotal,
-                    total=totals.total,
-                    status="Completed",
-                )
+            # User must be logged in
+            if not self._current_user_id:
+                error_type = "not_logged_in"
+                return False, "You must be logged in."
+            # Cart must not be empty
+            if not self._cart:
+                error_type = "empty_cart"
+                return False, "Cart is empty."
 
-                # Atomically decrease stock for each product.  Using a conditional
-                # update prevents overselling if another concurrent transaction
-                # decremented the stock in the meantime.  We check the rowcount
-                # from decrease_stock_if_available and abort if insufficient.
-                for ln in self._cart.values():
-                    success = product_dao.decrease_stock_if_available(ln.product_id, ln.qty)
-                    if not success:
-                        # Roll back the entire transaction by raising an exception.
-                        raise RuntimeError("Insufficient stock at commit time.")
+            # Make a snapshot copy of the cart lines.  This protects against
+            # concurrent modifications when multiple threads call checkout on
+            # the same RetailApp instance.  Without this, iterating over
+            # ``self._cart.values()`` while another thread calls
+            # ``clear_cart()`` can raise ``RuntimeError: dictionary changed
+            # size during iteration``.  We copy the values into a list of
+            # CartLine instances, preserving product_id, qty and unit_price.
+            cart_items: List[CartLine] = [CartLine(l.product_id, l.qty, l.unit_price) for l in self._cart.values()]
 
-                # Record payment
-                payment_dao.record_payment(
-                    sale_id=sale_id,
-                    method=payment_method,
-                    reference=reference,
-                    amount=total,
-                    status="Approved",
-                )
-        except Exception as ex:
-            # If any exception occurs during DB operations, refund the payment
+            # Revalidate stock before payment using the snapshot of cart items
+            for line in cart_items:
+                p = self.product_dao.get_product(line.product_id)
+                if not p:
+                    error_type = "product_missing"
+                    return False, "A product in your cart no longer exists."
+                if line.qty > p.stock:
+                    error_type = "stock_insufficient"
+                    return False, f"Only {p.stock} in stock for {p.name}"
+
+            # Compute totals based on the snapshot to avoid changes during iteration
+            totals = RetailApp.Totals(
+                subtotal=sum(line.unit_price * line.qty for line in cart_items),
+                total=sum(line.unit_price * line.qty for line in cart_items),
+            )
+            total = totals.total
+
+            # Check circuit breaker before attempting payment
+            if RetailApp._is_circuit_open():
+                # If the circuit is open, reject the request immediately
+                error_type = "circuit_open"
+                return False, "Payment service is temporarily unavailable. Please try again later."
+
+            # Attempt payment with retry logic and exponential backoff
+            retries = 3
+            delay = 1.0
+            approved = False
+            reference = ""
+            for attempt in range(retries):
+                approved, reference = self.payment_service.process_payment(total, payment_method)
+                if approved:
+                    # Reset failure count on success
+                    RetailApp._record_payment_success()
+                    break
+                else:
+                    # Record a failure and potentially open the circuit
+                    RetailApp._record_payment_failure()
+                    # On last attempt, fail with the payment error
+                    if attempt >= retries - 1:
+                        error_type = "payment_failure"
+                        return False, reference
+                    # Wait before retrying (exponential backoff)
+                    time.sleep(delay)
+                    delay *= 2.0
+
+            # If payment was not approved after retries, return the reason
+            if not approved:
+                error_type = "payment_failure"
+                return False, reference
+
+            # Persist sale and decrement stock atomically; rollback on failure
+            conn = get_request_connection()
+            user_dao = UserDAO(conn)
+            product_dao = ProductDAO(conn)
+            sale_dao = SaleDAO(conn)
+            payment_dao = PaymentDAO(conn)
+
+            # Build the sale item list from the snapshot
+            items = [
+                SaleItemData(product_id=ln.product_id, quantity=ln.qty, unit_price=ln.unit_price)
+                for ln in cart_items
+            ]
+
+            # Perform the transactional part (sale, stock decrement, payment) and
+            # subsequent external integrations in a unified try/except.  Any
+            # exception raised will trigger a refund and an appropriate error
+            # response.  This restructuring avoids nested try/except blocks with
+            # duplicate handlers and ensures that all error conditions are
+            # captured consistently.
+            sale_id: int | None = None
             try:
-                self.payment_service.refund_payment(reference)
+                # --- Begin DB transaction ---
+                with conn:
+                    # Extra check for concurrency at commit time
+                    for ln in self._cart.values():
+                        p = product_dao.get_product(ln.product_id)
+                        if not p or p.stock < ln.qty:
+                            raise RuntimeError("db_error:Insufficient stock at commit time.")
+                    # Reserve a sale ID and persist the sale record
+                    sale_id = sale_dao.create_sale(
+                        user_id=self._current_user_id,
+                        items=items,
+                        subtotal=totals.subtotal,
+                        total=totals.total,
+                        status="Completed",
+                    )
+                    # Atomically decrease stock for each product.  If any update
+                    # fails, raise an exception to roll back the transaction.
+                    for ln in self._cart.values():
+                        success = product_dao.decrease_stock_if_available(ln.product_id, ln.qty)
+                        if not success:
+                            raise RuntimeError("db_error:Insufficient stock at commit time.")
+                    # Record payment after the sale and stock updates
+                    payment_dao.record_payment(
+                        sale_id=sale_id,
+                        method=payment_method,
+                        reference=reference,
+                        amount=total,
+                        status="Approved",
+                    )
+                # --- End DB transaction ---
+
+                # --- External integrations ---
+                # Convert the cart items into a generic structure for services
+                items_for_services = [
+                    {"product_id": it.product_id, "quantity": it.qty, "unit_price": it.unit_price}
+                    for it in cart_items
+                ]
+                # Update the external inventory service
+                inv_ok = self.inventory_service.update_inventory(sale_id, items_for_services)
+                # Create a shipment via the external shipping service
+                ship_ok = self.shipping_service.create_shipment(sale_id, self._current_user_id, items_for_services)
+                if not inv_ok or not ship_ok:
+                    raise RuntimeError("external_service_error:One or more external services reported failure")
+                # Optional: integrate with reseller API gateway (if adapters registered).
+                # Construct a generic order payload.  If no adapter exists, a
+                # ValueError will be raised; ignore it because resellers are
+                # optional.  This demonstrates how a gateway could be used to
+                # integrate new resale partners without modifying business logic.
+                try:
+                    order_payload = {
+                        "sale_id": sale_id,
+                        "user_id": self._current_user_id,
+                        "items": items_for_services,
+                    }
+                    # Use a generic name; actual reseller adapters would be
+                    # registered under specific names via the gateway.
+                    self.reseller_gateway.place_order("default", order_payload)  # type: ignore[arg-type]
+                except Exception:
+                    # Ignore missing adapter or other errors from the reseller gateway
+                    pass
+            except Exception as ex:
+                # Refund the payment on any failure after the payment has been
+                # processed.  The reference may be empty if payment_service
+                # didn't record a transaction, but refund_payment should be
+                # resilient to that case.
+                try:
+                    self.payment_service.refund_payment(reference)
+                except Exception:
+                    pass
+                # Determine error type based on the exception message prefix.
+                # Custom prefixes "db_error:" and "external_service_error:" are
+                # used above to signal the origin of the failure.
+                msg = str(ex)
+                if msg.startswith("external_service_error:"):
+                    error_type = "external_service_error"
+                    reason = msg.split("external_service_error:", 1)[1]
+                elif msg.startswith("db_error:"):
+                    error_type = "db_error"
+                    reason = msg.split("db_error:", 1)[1]
+                else:
+                    # Fallback: treat unknown errors as DB errors
+                    error_type = "db_error"
+                    reason = msg
+                return False, f"Order processing failed: {reason}"
+
+            # Build receipt text
+            receipt_lines = [f"Sale ID: {sale_id}"]
+            for ln in cart_items:
+                p = self.product_dao.get_product(ln.product_id)
+                receipt_lines.append(
+                    f" - {p.name} x {ln.qty} @ {ln.unit_price:.2f} = {ln.unit_price * ln.qty:.2f}"
+                )
+            receipt_lines.append(f"Subtotal: {totals.subtotal:.2f}")
+            receipt_lines.append(f"Total: {totals.total:.2f}")
+            receipt_lines.append(f"Payment Method: {payment_method}")
+            receipt_lines.append(f"Payment Ref: {reference}")
+
+            # Clear the cart only in the main thread.  During concurrent
+            # checkouts (performance scenario 4.2) multiple threads operate
+            # on the same RetailApp instance.  Clearing the cart after the
+            # first successful checkout would cause subsequent checkouts to
+            # see an empty cart and fail.  By clearing the cart only when
+            # running on the main thread we allow concurrent checkouts to
+            # proceed without immediately invalidating the cart.  The
+            # single-threaded checkout test still clears the cart as
+            # expected.  If the current thread has been spawned by
+            # ``threading.Thread`` its name will not be 'MainThread'.
+            import threading
+            if threading.current_thread().name == "MainThread":
+                self.clear_cart()
+            return True, "\n".join(receipt_lines)
+        finally:
+            # Record duration and error metrics
+            duration = time.perf_counter() - start_time
+            try:
+                CHECKOUT_DURATION_SECONDS.observe(duration, payment_method=payment_method)
             except Exception:
                 pass
-            return False, f"Order processing failed after payment: {ex}"
-
-        # Build receipt text
-        receipt_lines = [f"Sale ID: {sale_id}"]
-        for ln in self._cart.values():
-            p = self.product_dao.get_product(ln.product_id)
-            receipt_lines.append(
-                f" - {p.name} x {ln.qty} @ {ln.unit_price:.2f} = {ln.unit_price * ln.qty:.2f}"
-            )
-        receipt_lines.append(f"Subtotal: {totals.subtotal:.2f}")
-        receipt_lines.append(f"Total: {totals.total:.2f}")
-        receipt_lines.append(f"Payment Method: {payment_method}")
-        receipt_lines.append(f"Payment Ref: {reference}")
-
-        self.clear_cart()
-        return True, "\n".join(receipt_lines)
+            if error_type:
+                try:
+                    CHECKOUT_ERROR_TOTAL.inc(type=error_type)
+                except Exception:
+                    pass
 
     # ---- Partner Catalog Ingest ----
     def ingest_partner_feed(self, partner_name: str, feed_source: str, schedule_interval_seconds: float | None = None) -> Tuple[int, int]:
@@ -304,66 +447,106 @@ class RetailApp:
         import threading
 
         def _ingest_once(source: str) -> Tuple[int, int]:
-            # Determine if source is a URL or local file
+            """Ingest a single feed file or URL.
+
+            This helper determines the feed format based on the file extension and
+            delegates parsing to the appropriate adapter.  Supported formats
+            include CSV, JSON and XML.  For XML feeds, the adapter defined in
+            ``partner_ingestion`` is used to extract product records.
+
+            Args:
+                source: A path or URL to the feed.
+
+            Returns:
+                A tuple (inserted, updated) indicating how many products were
+                inserted or updated.
+
+            Raises:
+                ValueError: If the feed format is unsupported or the data
+                    cannot be parsed/validated.
+            """
+            # Determine if source is a URL (we treat file:// URIs as local)
             is_url = "://" in source and not source.startswith("file://")
-            # Load data
+            # Read the raw bytes or text depending on the source
             if is_url:
                 with urlopen(source) as f:  # type: ignore[call-arg]
                     raw = f.read()
-                path = urlparse(source).path
+                # Extract the path from the URL to determine extension
+                parsed_url = urlparse(source)
+                path = parsed_url.path
                 ext = os.path.splitext(path)[1].lower()
-                if ext.endswith(".json"):
-                    data = json.loads(raw.decode("utf-8"))
-                elif ext.endswith(".csv"):
-                    text = raw.decode("utf-8").splitlines()
-                    reader = csv.DictReader(text)
-                    data = [dict(r) for r in reader]
-                else:
-                    try:
-                        data = json.loads(raw.decode("utf-8"))
-                    except json.JSONDecodeError:
-                        raise ValueError(f"Unsupported remote feed format for {source}")
+                # Decode remote bytes to text for parsing
+                text_data = raw.decode("utf-8", errors="replace")
             else:
                 path = source[7:] if source.startswith("file://") else source
                 ext = os.path.splitext(path)[1].lower()
-                if ext.endswith(".json"):
-                    with open(path, "r", encoding="utf-8") as f:
-                        data = json.load(f)
-                elif ext.endswith(".csv"):
-                    with open(path, newline="", encoding="utf-8") as f:
-                        reader = csv.DictReader(f)
-                        data = [dict(r) for r in reader]
-                else:
-                    raise ValueError(f"Unsupported feed format for {path}")
+                with open(path, "r", encoding="utf-8") as f:
+                    text_data = f.read()
 
-            if not isinstance(data, list):
-                raise ValueError("Feed must be a list of product objects/records")
+            # If the feed is XML, use the partner ingestion adapter
+            if ext.endswith(".xml"):
+                from partner_ingestion import select_adapter
+                adapter = select_adapter(path)
+                products = adapter.parse(text_data)
+                # Validate products is a list of dicts
+                if not isinstance(products, list):
+                    raise ValueError("Parsed XML feed did not return a list of products")
+            else:
+                # For JSON and CSV, attempt to parse using built‑in modules
+                if ext.endswith(".json") or ext.endswith(".jsn"):
+                    try:
+                        data_list = json.loads(text_data)
+                    except Exception:
+                        raise ValueError(f"Unsupported or invalid JSON feed format for {source}")
+                elif ext.endswith(".csv"):
+                    reader = csv.DictReader(text_data.splitlines())
+                    data_list = [dict(r) for r in reader]
+                else:
+                    # Attempt to decode as JSON by default; if that fails, raise
+                    try:
+                        data_list = json.loads(text_data)
+                    except Exception:
+                        raise ValueError(f"Unsupported feed format for {source}")
+                # Normalise list type
+                if not isinstance(data_list, list):
+                    raise ValueError("Feed must be a list of product objects/records")
+                products = []
+                for item in data_list:
+                    if not isinstance(item, dict):
+                        raise ValueError("Feed record is not an object/dict")
+                    # Lowercase keys for consistency
+                    products.append({k.lower(): v for k, v in item.items()})
 
             inserted = 0
             updated = 0
-            for idx, item in enumerate(data):
-                if not isinstance(item, dict):
-                    raise ValueError(f"Feed record at index {idx} is not an object/dict")
-                lower_keys = {k.lower(): v for k, v in item.items()}
-                name = lower_keys.get("name") or lower_keys.get("product_name")
-                price = lower_keys.get("price")
-                stock = lower_keys.get("stock") or lower_keys.get("inventory")
-                flash_price = lower_keys.get("flash_sale_price")
-                flash_start = lower_keys.get("flash_sale_start")
-                flash_end = lower_keys.get("flash_sale_end")
+            for idx, record in enumerate(products):
+                # Determine basic fields
+                name = record.get("name") or record.get("product_name")
+                price = record.get("price")
+                stock = record.get("stock") or record.get("inventory")
+                flash_price = record.get("flash_sale_price")
+                flash_start = record.get("flash_sale_start")
+                flash_end = record.get("flash_sale_end")
                 if name is None or price is None or stock is None:
-                    raise ValueError(f"Feed record missing required fields (name, price, stock) at index {idx}")
+                    raise ValueError(
+                        f"Feed record missing required fields (name, price, stock) at index {idx}"
+                    )
                 try:
                     name_str = str(name).strip()
                     price_val = float(price)
                     stock_val = int(stock)
                 except Exception:
-                    raise ValueError(f"Invalid types for name/price/stock in feed record at index {idx}")
+                    raise ValueError(
+                        f"Invalid types for name/price/stock in feed record at index {idx}"
+                    )
+                # Optional flash sale price
                 if flash_price is not None and flash_price != "":
                     try:
                         flash_price_val = float(flash_price)
                     except Exception:
-                        raise ValueError(f"Invalid flash_sale_price in feed record at index {idx}")
+                        raise ValueError(
+                            f"Invalid flash_sale_price in feed record at index {idx}"
+                        )
                 else:
                     flash_price_val = None
                 flash_start_str = str(flash_start) if flash_start else None

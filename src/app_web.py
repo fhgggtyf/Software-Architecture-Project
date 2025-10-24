@@ -27,11 +27,29 @@ import os
 import urllib.parse
 import uuid
 import threading
+import time
+import logging
 from http import cookies
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Dict, Optional
 
+# Import the business logic
 from app import RetailApp
+from external_services import reseller_gateway  # ensure gateway imported for future use
+import json
+
+# Configure logging and import metrics
+import logging_config  # custom logging configuration module
+from metrics import (
+    HTTP_REQUESTS_TOTAL,
+    HTTP_REQUEST_LATENCY_SECONDS,
+    generate_metrics_text,
+)
+
+# Initialize logging as soon as the module is loaded.  This sets up
+# JSON formatting and file/console handlers.  It will no‑op if called
+# multiple times.
+logging_config.configure_logging()
 
 try:
     from sqlite3 import IntegrityError
@@ -44,6 +62,34 @@ except ImportError:
 _SESSIONS: Dict[str, Dict[str, object]] = {}
 _SESS_LOCK = threading.RLock()
 SESSION_COOKIE_NAME = "sid"
+
+# -----------------------------------------------------------------------------
+# Partner API keys and workload recording
+#
+# Scenario 2.1 requires that partner feed ingestion be authenticated.  Keys
+# can be provided via the PARTNER_API_KEYS environment variable in the form
+# "key1:partnerA,key2:partnerB".  If none are set, a default dummy key is
+# registered for testing purposes.
+
+def _load_partner_api_keys() -> Dict[str, str]:
+    keys: Dict[str, str] = {}
+    env = os.environ.get("PARTNER_API_KEYS")
+    if env:
+        for pair in env.split(","):
+            if ":" in pair:
+                k, v = pair.split(":", 1)
+                keys[k.strip()] = v.strip()
+    # Fallback dummy key to support the test harness
+    if not keys:
+        keys["dummy"] = "default"
+    return keys
+
+# Dictionary mapping API keys to partner names
+_PARTNER_API_KEYS: Dict[str, str] = _load_partner_api_keys()
+
+# Request log storage for workload capture and replay (testability scenario 6.1)
+_REQUEST_LOG: list[Dict[str, object]] = []
+_REQUEST_LOG_LOCK = threading.Lock()
 
 def _warmup_db():
     try:
@@ -108,13 +154,73 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
             self.set_cookie_header()
         self.end_headers()
         self.wfile.write(content.encode("utf-8"))
+        # Record metrics for this request after sending the response
+        try:
+            self._record_metrics(status)
+        except Exception:
+            pass
 
     def _redirect(self, location: str) -> None:
-        self.send_response(302)
+        status = 302
+        self.send_response(status)
         self.send_header("Location", location)
         if self.set_cookie_header:
             self.set_cookie_header()
         self.end_headers()
+        # Record metrics for this redirect
+        try:
+            self._record_metrics(status)
+        except Exception:
+            pass
+
+    # -------------------
+    # Metrics helper
+    # -------------------
+    def _record_metrics(self, status: int) -> None:
+        """Record metrics for the current request.
+
+        This helper updates the global request counter and latency histogram.
+        It ensures that metrics are recorded only once per request.  The
+        ``status`` parameter should be the HTTP status code that was sent
+        in the response.
+        """
+        # Only record metrics once per request
+        if getattr(self, "_metrics_recorded", False):
+            return
+        # Determine endpoint (path without query string)
+        try:
+            endpoint = self.path.partition("?")[0]
+        except Exception:
+            endpoint = "unknown"
+        method = getattr(self, "command", "?")
+        # Increment request counter
+        try:
+            HTTP_REQUESTS_TOTAL.inc(endpoint=endpoint, method=method, status=str(status))
+        except Exception:
+            pass
+        # Observe latency
+        try:
+            # If start time recorded, compute latency; otherwise zero
+            start = getattr(self, "_request_start_time", None)
+            if start is not None:
+                latency = time.perf_counter() - start
+            else:
+                latency = 0.0
+            HTTP_REQUEST_LATENCY_SECONDS.observe(latency, endpoint=endpoint)
+        except Exception:
+            pass
+        # Record the request in the workload log for replay/testing purposes
+        try:
+            with _REQUEST_LOG_LOCK:
+                _REQUEST_LOG.append({
+                    "method": method,
+                    "endpoint": endpoint,
+                    "timestamp": time.time(),
+                })
+        except Exception:
+            pass
+        # Mark as recorded
+        self._metrics_recorded = True
 
     # -------------
     # Page chrome
@@ -167,14 +273,48 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
     # Request entry
     # --------------
     def _begin_request(self):
+        # Create or retrieve the session.  Each request gets a session and a cookie setter.
         self.sid, self.session, self.set_cookie_header = _get_or_create_session(self)
+        # Record the start time for metrics.  This is used to compute latency.
+        self._request_start_time = time.perf_counter()
+        # Flag to ensure we record metrics only once per request
+        self._metrics_recorded = False
 
     def do_GET(self) -> None:
+        # Special endpoint for metrics.  Do not create a session or set cookies.
+        metrics_path = self.path.partition("?")[0]
+        if metrics_path == "/metrics":
+            output = generate_metrics_text()
+            # Send plain text in Prometheus exposition format
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.end_headers()
+            try:
+                self.wfile.write(output)
+            except Exception:
+                pass
+            return
+
+        # Normal request handling: set up session and record start time
         self._begin_request()
         path, _, _ = self.path.partition("?")
 
         if path == "/" or path == "":
             self._redirect("/products")
+            return
+        # Partner feed ingestion (authenticated).  Scenario 2.1.
+        if path.startswith("/partner/feed"):
+            self._handle_partner_feed_get()
+            return
+        # Workload capture and replay endpoints (testability).  Scenario 6.1.
+        if path == "/workload/log":
+            self._handle_workload_log_get()
+            return
+        if path == "/workload/clear":
+            self._handle_workload_clear_get()
+            return
+        if path == "/workload/replay":
+            self._handle_workload_replay_get()
             return
         if path == "/register":
             self._handle_register_get()
@@ -258,6 +398,18 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
         if path == "/cart/clear":
             self._handle_cart_clear_post()
             return
+        # New reseller order endpoint (integrability scenario 5.1).
+        # Allows external resellers or marketplace adapters to submit orders
+        # to the system.  Orders are forwarded to the ResellerAPIGateway
+        # configured in the current RetailApp instance.  The request body
+        # should contain a JSON object with at least a ``reseller`` name
+        # and an ``items`` list.  Unknown reseller names will result in
+        # a 400 error.  On success, a confirmation page is returned.  This
+        # endpoint demonstrates how new reseller APIs can be onboarded via
+        # the adapter/gateway pattern without modifying business logic.
+        if path == "/reseller/order":
+            self._handle_reseller_order_post()
+            return
         if path == "/checkout":
             self._handle_checkout_post()
             return
@@ -331,11 +483,17 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
                 pass
             price_html = f"{effective_price:.2f}"
             if on_sale:
-                price_html = (
+                # When on sale, show the original price struck through, the sale price,
+                # and a countdown timer placeholder that will be updated via JS.
+                sale_info = (
                     f"<span style='text-decoration:line-through;color:#777'>{p.price:.2f}</span> "
                     f"<span style='color:#d00;font-weight:bold'>{p.flash_sale_price:.2f}</span>"
-                    f"<br><small>Sale: {p.flash_sale_start} → {p.flash_sale_end}</small>"
                 )
+                sale_info += (
+                    f"<br><small>Sale: {p.flash_sale_start} → {p.flash_sale_end}</small>"
+                    f"<br><span class='flash-countdown' data-end='{p.flash_sale_end}'></span>"
+                )
+                price_html = sale_info
             else:
                 price_html = f"{p.price:.2f}"
 
@@ -352,18 +510,46 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
                 "</td></tr>"
             )
             rows.append(row)
+        # Join table rows into a single HTML string outside the f-string to avoid
+        # embedding backslashes in f-string expressions (Python 3.12+ restriction).
+        rows_html = "\n".join(rows)
         table_html = f"""
 <h1>Products</h1>
 <table>
   <tr><th>ID</th><th>Name</th><th>Price</th><th>Stock</th><th>Add to Cart</th></tr>
-  {'\n'.join(rows)}
+  {rows_html}
 </table>
 """
         username = self.session.get("username")
         admin_html = ""
         if username and app.current_user_is_admin(username):  # type: ignore[arg-type]
             admin_html = "<p><a href='/admin/product/new'>Add New Product</a></p>"
-        self._send_html(self._wrap_page("Products", table_html + admin_html))
+        # Include a countdown script for flash sale items (usability scenario 7.2)
+        countdown_script = """
+<script>
+function updateCountdown() {
+  document.querySelectorAll('.flash-countdown').forEach(function(el) {
+    var end = el.dataset.end;
+    var endMs = Date.parse(end);
+    var now = Date.now();
+    var diff = endMs - now;
+    if (diff > 0) {
+      var secs = Math.floor(diff / 1000);
+      var mins = Math.floor(secs / 60);
+      var hrs = Math.floor(mins / 60);
+      secs = secs % 60;
+      mins = mins % 60;
+      el.textContent = hrs + 'h ' + mins + 'm ' + secs + 's remaining';
+    } else {
+      el.textContent = 'Sale ended';
+    }
+  });
+}
+setInterval(updateCountdown, 1000);
+window.addEventListener('load', updateCountdown);
+</script>
+"""
+        self._send_html(self._wrap_page("Products", table_html + admin_html + countdown_script))
 
     def _handle_admin_products_get(self) -> None:
         app: RetailApp = self.session["app"]  # type: ignore[assignment]
@@ -380,12 +566,15 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
                 f"<td><form method='post' action='/admin/product/{p.id}/delete' style='display:inline'>"
                 f"<button type='submit'>Delete</button></form></td></tr>"
             )
+        # Avoid using a backslash in f-string expressions by joining rows outside
+        # of the f-string.
+        rows_html = "\n".join(rows)
         table_html = f"""
 <h1>Admin Products</h1>
 <p><a href='/admin/product/new'>Add New Product</a></p>
 <table>
   <tr><th>ID</th><th>Name</th><th>Price</th><th>Stock</th><th></th><th></th></tr>
-  {'\n'.join(rows)}
+  {rows_html}
 </table>
 """
         self._send_html(self._wrap_page("Admin Products", table_html))
@@ -450,11 +639,14 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
                 f"<button type='submit'>Remove</button></form></td></tr>"
             )
         totals = app.compute_cart_totals()
+        # Join rows into a single string prior to constructing the HTML to
+        # avoid embedding a backslash within an f-string expression.
+        rows_html = "\n".join(rows)
         body = f"""
 <h1>Your Cart</h1>
 <table>
   <tr><th>Product ID</th><th>Name</th><th>Qty</th><th>Unit Price</th><th>Total</th><th></th></tr>
-  {'\n'.join(rows)}
+  {rows_html}
 </table>
 <p>Subtotal: {totals.subtotal:.2f} &nbsp; Total: {totals.total:.2f}</p>
 <form method='post' action='/cart/clear'>
@@ -657,6 +849,192 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
                     f"<p>Payment failed: {html_escape(res)}</p><p><a href='/cart'>Back to cart</a></p>",
                 )
             )
+
+    # ------------------------------------------------------------------
+    # Partner feed handler (Security scenario 2.1)
+    # ------------------------------------------------------------------
+    def _handle_partner_feed_get(self) -> None:
+        """Handle GET requests to /partner/feed.
+
+        This endpoint ingests partner product feeds on behalf of external
+        resellers.  Access is controlled via an API key supplied either
+        as a query parameter (``api_key``) or as an ``X-API-Key`` HTTP
+        header.  If the key is not recognised, the request is rejected.
+
+        Optional query parameters:
+
+          * ``partner`` – logical partner name (ignored if the API key
+            determines the partner).
+          * ``source`` – file path or URL to the partner feed (CSV, JSON, XML).
+
+        If ``source`` is omitted, a simple success message is returned.  If
+        provided, the server attempts to ingest the feed immediately using
+        ``RetailApp.ingest_partner_feed``.
+        """
+        # Extract the API key from query string or header
+        parsed = urllib.parse.urlparse(self.path)
+        params = urllib.parse.parse_qs(parsed.query)
+        api_key = params.get("api_key", [None])[0] or self.headers.get("X-API-Key")
+        if not api_key or api_key not in _PARTNER_API_KEYS:
+            self._send_html(self._wrap_page("Unauthorized", "<p>Missing or invalid API key.</p>"), 401)
+            return
+        partner_name = _PARTNER_API_KEYS.get(api_key, "unknown")
+        # Determine the feed source if provided
+        feed_src = params.get("source", [None])[0]
+        app: RetailApp = self.session["app"]  # type: ignore[assignment]
+        if feed_src:
+            try:
+                inserted, updated = app.ingest_partner_feed(partner_name, feed_src)
+                body = (
+                    f"<p>Partner feed ingested for {html_escape(partner_name)}.</p>"
+                    f"<p>Inserted {inserted}, updated {updated} products.</p>"
+                )
+            except Exception as ex:
+                body = f"<p>Error ingesting feed: {html_escape(str(ex))}</p>"
+                self._send_html(self._wrap_page("Partner Feed Error", body), 500)
+                return
+            self._send_html(self._wrap_page("Partner Feed", body))
+            return
+        # No source specified – simply confirm authentication
+        body = f"<p>Authenticated partner request for {html_escape(partner_name)}.</p>"
+        self._send_html(self._wrap_page("Partner Feed", body))
+
+    # ------------------------------------------------------------------
+    # Workload capture and replay handlers (Testability scenarios 6.1/6.2)
+    # ------------------------------------------------------------------
+    def _handle_workload_log_get(self) -> None:
+        """Return the recorded request log as JSON inside a <pre> block."""
+        import json
+        with _REQUEST_LOG_LOCK:
+            log_copy = list(_REQUEST_LOG)
+        body = "<h1>Recorded Workload</h1><pre>" + html_escape(json.dumps(log_copy, indent=2)) + "</pre>"
+        self._send_html(self._wrap_page("Workload Log", body))
+
+    def _handle_workload_clear_get(self) -> None:
+        """Clear the recorded workload log."""
+        with _REQUEST_LOG_LOCK:
+            _REQUEST_LOG.clear()
+        body = "<p>Workload log cleared.</p>"
+        self._send_html(self._wrap_page("Workload Cleared", body))
+
+    def _handle_workload_replay_get(self) -> None:
+        """Replay the recorded workload by invoking local business logic.
+
+        For each recorded request, a corresponding call is made directly
+        against the ``RetailApp`` instance held in the session.  Only a
+        subset of endpoints are replayed: ``/products`` will call
+        ``list_products`` and ``/cart`` will call ``view_cart``.  The
+        results are summarised and displayed.  In a full system, this
+        handler could reissue HTTP requests or drive the UI to reproduce
+        real workloads.
+        """
+        app: RetailApp = self.session["app"]  # type: ignore[assignment]
+        with _REQUEST_LOG_LOCK:
+            log_copy = list(_REQUEST_LOG)
+        summaries: list[str] = []
+        for entry in log_copy:
+            endpoint = entry.get("endpoint")
+            method = entry.get("method")
+            if endpoint == "/products" and method == "GET":
+                products = app.list_products()
+                summaries.append(f"/products -> {len(products)} products")
+            elif endpoint == "/cart" and method == "GET":
+                items = app.view_cart()
+                summaries.append(f"/cart -> {len(items)} items in cart")
+        if not summaries:
+            summaries.append("No replayable requests recorded.")
+        body = "<h1>Workload Replay</h1><pre>" + html_escape("\n".join(summaries)) + "</pre>"
+        self._send_html(self._wrap_page("Workload Replay", body))
+
+    # ------------------------------------------------------------------
+    # Reseller order handler (Integrability scenario 5.1)
+    # ------------------------------------------------------------------
+    def _handle_reseller_order_post(self) -> None:
+        """Handle POST requests to /reseller/order.
+
+        External resellers can place orders through this endpoint.  The
+        request body should contain a JSON object with the keys:
+
+          * ``reseller`` – name of the reseller (adapter name registered
+            in ``ResellerAPIGateway``).  If omitted, defaults to "default".
+          * ``items`` – a list of order items.  Each item should be a
+            dictionary with at minimum ``product_id`` and ``quantity``.
+
+        The handler looks up the adapter via the current session's
+        ``RetailApp.reseller_gateway`` and forwards the order.  On
+        success a confirmation message is displayed.  If the reseller
+        name is unknown or the payload cannot be parsed, a 400
+        response is returned.
+
+        Note: This simple implementation does not decrement stock or
+        persist the order; it is intended to demonstrate how new
+        reseller APIs can be integrated without changing core logic.
+        """
+        # Read the raw request body
+        content_length = 0
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except Exception:
+            pass
+        raw_data = b""
+        if content_length:
+            try:
+                raw_data = self.rfile.read(content_length)
+            except Exception:
+                raw_data = b""
+        # Attempt to parse JSON payload
+        data: dict[str, object] = {}
+        if raw_data:
+            try:
+                data = json.loads(raw_data.decode("utf-8"))
+                if not isinstance(data, dict):
+                    data = {}
+            except Exception:
+                data = {}
+        # Fallback to query string parameters if JSON was not provided
+        if not data:
+            # Parse x-www-form-urlencoded body
+            try:
+                length = content_length
+                body = raw_data.decode("utf-8") if raw_data else ""
+                params = urllib.parse.parse_qs(body)
+                data = {k: v[0] for k, v in params.items() if v}
+            except Exception:
+                data = {}
+        # Determine reseller name and items
+        reseller_name = str(data.get("reseller", "default")).strip().lower()
+        items = data.get("items")
+        # If items is a JSON string, attempt to parse it
+        if isinstance(items, str):
+            try:
+                items_parsed = json.loads(items)
+                if isinstance(items_parsed, list):
+                    items = items_parsed
+            except Exception:
+                pass
+        # Validate items is a list
+        if not isinstance(items, list):
+            items = []
+        # Build a generic order payload
+        order = {
+            "reseller": reseller_name,
+            "items": items,
+        }
+        # Obtain the RetailApp from the session
+        app: RetailApp = self.session.get("app")  # type: ignore[assignment]
+        if not app:
+            # Should not happen; fallback error
+            self._send_html(self._wrap_page("Error", "<p>Internal session error.</p>"), 500)
+            return
+        # Attempt to place the order via the gateway
+        try:
+            app.reseller_gateway.place_order(reseller_name, order)
+            body = f"<p>Order for reseller '{html_escape(reseller_name)}' has been accepted.</p>"
+            self._send_html(self._wrap_page("Reseller Order", body), 200)
+        except Exception as ex:
+            # Unknown adapter or other failure
+            body = f"<p>Failed to place reseller order: {html_escape(str(ex))}</p>"
+            self._send_html(self._wrap_page("Reseller Order Error", body), 400)
 
 
 def run_server(host: str = "localhost", port: int = 8000) -> None:
