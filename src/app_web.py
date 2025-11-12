@@ -44,6 +44,11 @@ from metrics import (
     HTTP_REQUESTS_TOTAL,
     HTTP_REQUEST_LATENCY_SECONDS,
     generate_metrics_text,
+    RMA_REQUESTS_TOTAL,
+    RMA_PROCESSING_DURATION_SECONDS,
+    RMA_REFUNDS_TOTAL,
+    CHECKOUT_ERROR_TOTAL,
+    CIRCUIT_BREAKER_OPEN,
 )
 
 # Initialize logging as soon as the module is loaded.  This sets up
@@ -237,7 +242,12 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
             # Show admin link if the current user has admin rights
             if app.current_user_is_admin(username):  # type: ignore[arg-type]
                 parts.append('<a href="/admin/products">Admin</a>')
+                # Admins can manage returns from a dedicated page
+                parts.append('<a href="/admin/returns">Returns</a>')
             parts.append(f"<span>Hi, {html_escape(str(username))}</span>")
+            # Logged in users can view their order history and returns
+            parts.append('<a href="/orders">Orders</a>')
+            parts.append('<a href="/returns">My Returns</a>')
             parts.append('<a href="/logout">Logout</a>')
         else:
             parts.append('<a href="/login">Login</a>')
@@ -352,6 +362,23 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
             self._handle_checkout_get()
             return
 
+        # New endpoints for orders and returns
+        if path == "/orders":
+            self._handle_orders_get()
+            return
+        if path == "/return-request":
+            self._handle_return_request_get()
+            return
+        if path == "/returns":
+            self._handle_returns_get()
+            return
+        if path == "/admin/returns":
+            self._handle_admin_returns_get()
+            return
+        if path == "/dashboard":
+            self._handle_dashboard_get()
+            return
+
         self._send_html(self._wrap_page("404 Not Found", "<p>Page not found.</p>"), 404)
 
     def do_POST(self) -> None:
@@ -412,6 +439,31 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
             return
         if path == "/checkout":
             self._handle_checkout_post()
+            return
+
+        # New endpoints: handle return request submission
+        if path == "/return-request":
+            self._handle_return_request_post()
+            return
+        # Admin actions on returns: approve or reject
+        if path.startswith("/admin/returns/") and (path.endswith("/approve") or path.endswith("/reject")):
+            # URL pattern: /admin/returns/<id>/approve or /reject
+            parts = path.strip("/").split("/")
+            if len(parts) == 4:
+                _, section, rma_id_str, action = parts
+                try:
+                    rma_id = int(rma_id_str)
+                except ValueError:
+                    self._send_html(self._wrap_page("Error", "Invalid return ID."), 400)
+                    return
+                if action == "approve":
+                    self._handle_admin_return_action_post(rma_id, approve=True)
+                    return
+                elif action == "reject":
+                    self._handle_admin_return_action_post(rma_id, approve=False)
+                    return
+            # Fallback 404 if pattern does not match
+            self._send_html(self._wrap_page("Not Found", "Invalid return action."), 404)
             return
 
         self._send_html(self._wrap_page("404 Not Found", "<p>Page not found.</p>"), 404)
@@ -1037,7 +1089,232 @@ window.addEventListener('load', updateCountdown);
             self._send_html(self._wrap_page("Reseller Order Error", body), 400)
 
 
-def run_server(host: str = "localhost", port: int = 8000) -> None:
+    # -----------------------------------------------------------------
+    # Orders and Returns (User-facing)
+    # -----------------------------------------------------------------
+    def _handle_orders_get(self) -> None:
+        """Display the current user's order history with return options."""
+        app: RetailApp = self.session["app"]  # type: ignore[assignment]
+        username = self.session.get("username")
+        if not username or not getattr(app, "_current_user_id", None):
+            self._send_html(self._wrap_page("Unauthorized", "<p>You must be logged in to view orders.</p>"), 403)
+            return
+        user_id = getattr(app, "_current_user_id", None)
+        # Query the Sale table for this user
+        try:
+            from dao import get_request_connection
+            conn = get_request_connection()
+            rows = conn.execute(
+                "SELECT id, timestamp, total, status FROM Sale WHERE user_id = ? ORDER BY id DESC;",
+                (user_id,),
+            ).fetchall()
+        except Exception as e:
+            self._send_html(self._wrap_page("Error", f"<p>Error fetching orders: {html_escape(str(e))}</p>"), 500)
+            return
+        # Build return lookup to determine existing requests
+        try:
+            existing = {r.sale_id: r for r in app.return_dao.list_returns(user_id)}
+        except Exception:
+            existing = {}
+        rows_html = []
+        for r in rows:
+            sale_id, ts, total, status = r["id"], r["timestamp"], r["total"], r["status"]
+            # Format timestamp (ISO) to something nicer
+            ts_str = html_escape(ts)
+            # Determine return action/status
+            if sale_id in existing:
+                rma = existing[sale_id]
+                rma_status = rma.status
+                return_html = f"{html_escape(rma_status)} (RMA {html_escape(rma.rma_number)})"
+            elif status == "Completed":
+                # Provide link to request return
+                return_html = (
+                    f"<form method='get' action='/return-request' style='display:inline'>"
+                    f"<input type='hidden' name='sale_id' value='{sale_id}' />"
+                    f"<button type='submit'>Request Return</button></form>"
+                )
+            else:
+                return_html = "N/A"
+            rows_html.append(
+                f"<tr><td>{sale_id}</td><td>{ts_str}</td><td>{total:.2f}</td><td>{html_escape(status)}</td>"
+                f"<td>{return_html}</td></tr>"
+            )
+        body = """
+<h1>My Orders</h1>
+<table>
+  <tr><th>Sale ID</th><th>Timestamp</th><th>Total</th><th>Status</th><th>Return</th></tr>
+  {} 
+</table>
+""".format("\n".join(rows_html))
+        self._send_html(self._wrap_page("Orders", body))
+
+    def _handle_return_request_get(self) -> None:
+        """Show a form for the user to submit a return request for a sale."""
+        app: RetailApp = self.session["app"]  # type: ignore[assignment]
+        username = self.session.get("username")
+        if not username or not getattr(app, "_current_user_id", None):
+            self._send_html(self._wrap_page("Unauthorized", "<p>You must be logged in to request a return.</p>"), 403)
+            return
+        # Parse sale_id from query string
+        try:
+            query = urllib.parse.parse_qs(self.path.partition("?")[2], keep_blank_values=True)
+            sale_id_str = query.get("sale_id", [None])[0]
+            sale_id = int(sale_id_str) if sale_id_str is not None else None
+        except Exception:
+            sale_id = None
+        if not sale_id:
+            self._send_html(self._wrap_page("Error", "<p>Missing or invalid sale ID.</p>"), 400)
+            return
+        # Show form to enter reason
+        body = f"""
+<h1>Request Return for Sale {sale_id}</h1>
+<form method='post' action='/return-request'>
+  <input type='hidden' name='sale_id' value='{sale_id}' />
+  <label>Reason:<br><textarea name='reason' rows='4' cols='40' required></textarea></label><br>
+  <button type='submit'>Submit Return Request</button>
+</form>
+"""
+        self._send_html(self._wrap_page("Request Return", body))
+
+    def _handle_returns_get(self) -> None:
+        """Display the current user's return requests and their statuses."""
+        app: RetailApp = self.session["app"]  # type: ignore[assignment]
+        username = self.session.get("username")
+        if not username or not getattr(app, "_current_user_id", None):
+            self._send_html(self._wrap_page("Unauthorized", "<p>You must be logged in to view returns.</p>"), 403)
+            return
+        user_id = getattr(app, "_current_user_id", None)
+        try:
+            requests = app.return_dao.list_returns(user_id)
+        except Exception as e:
+            self._send_html(self._wrap_page("Error", f"<p>Error fetching returns: {html_escape(str(e))}</p>"), 500)
+            return
+        rows_html = []
+        for r in requests:
+            # Format timestamps; handle None
+            req_ts = html_escape(r.request_timestamp)
+            res_ts = html_escape(r.resolution_timestamp) if r.resolution_timestamp else "-"
+            refund_ref = html_escape(r.refund_reference) if r.refund_reference else "-"
+            rows_html.append(
+                f"<tr><td>{r.id}</td><td>{html_escape(r.rma_number)}</td><td>{r.sale_id}</td><td>{html_escape(r.reason)}</td>"
+                f"<td>{html_escape(r.status)}</td><td>{req_ts}</td><td>{res_ts}</td><td>{refund_ref}</td></tr>"
+            )
+        body = """
+<h1>My Return Requests</h1>
+<table>
+  <tr><th>ID</th><th>RMA Number</th><th>Sale ID</th><th>Reason</th><th>Status</th><th>Requested</th><th>Resolved</th><th>Refund Ref</th></tr>
+  {} 
+</table>
+""".format("\n".join(rows_html))
+        self._send_html(self._wrap_page("Returns", body))
+
+    # -----------------------------------------------------------------
+    # Returns (Admin-facing)
+    # -----------------------------------------------------------------
+    def _handle_admin_returns_get(self) -> None:
+        """Display all return requests for admin processing."""
+        app: RetailApp = self.session["app"]  # type: ignore[assignment]
+        username = self.session.get("username")
+        if not username or not app.current_user_is_admin(username):  # type: ignore[arg-type]
+            self._send_html(self._wrap_page("Unauthorized", "<p>You do not have permission to access this page.</p>"), 403)
+            return
+        try:
+            requests = app.return_dao.list_returns()
+        except Exception as e:
+            self._send_html(self._wrap_page("Error", f"<p>Error fetching returns: {html_escape(str(e))}</p>"), 500)
+            return
+        rows_html = []
+        for r in requests:
+            req_ts = html_escape(r.request_timestamp)
+            res_ts = html_escape(r.resolution_timestamp) if r.resolution_timestamp else "-"
+            refund_ref = html_escape(r.refund_reference) if r.refund_reference else "-"
+            actions = ""
+            if r.status == "Pending":
+                actions = (
+                    f"<form method='post' action='/admin/returns/{r.id}/approve' style='display:inline'>"
+                    f"<button type='submit'>Approve</button></form> "
+                    f"<form method='post' action='/admin/returns/{r.id}/reject' style='display:inline'>"
+                    f"<input type='text' name='reason' placeholder='Reason' required style='width:8rem' /> "
+                    f"<button type='submit'>Reject</button></form>"
+                )
+            rows_html.append(
+                f"<tr><td>{r.id}</td><td>{html_escape(r.rma_number)}</td><td>{r.sale_id}</td><td>{html_escape(r.reason)}</td>"
+                f"<td>{html_escape(r.status)}</td><td>{req_ts}</td><td>{res_ts}</td><td>{refund_ref}</td><td>{actions}</td></tr>"
+            )
+        body = """
+<h1>All Return Requests</h1>
+<table>
+  <tr><th>ID</th><th>RMA</th><th>Sale ID</th><th>Reason</th><th>Status</th><th>Requested</th><th>Resolved</th><th>Refund Ref</th><th>Actions</th></tr>
+  {} 
+</table>
+""".format("\n".join(rows_html))
+        self._send_html(self._wrap_page("Admin Returns", body))
+
+    def _handle_admin_return_action_post(self, rma_id: int, approve: bool) -> None:
+        """Handle admin approval or rejection of a return."""
+        app: RetailApp = self.session["app"]  # type: ignore[assignment]
+        username = self.session.get("username")
+        if not username or not app.current_user_is_admin(username):  # type: ignore[arg-type]
+            self._send_html(self._wrap_page("Unauthorized", "<p>You do not have permission to perform this action.</p>"), 403)
+            return
+        # Parse POST data for rejection reason if needed
+        reason = None
+        if not approve:
+            params = self._parse_post_data()
+            reason = params.get("reason") or "Rejected"
+        if approve:
+            ok, msg = app.approve_return(rma_id)
+        else:
+            ok, msg = app.reject_return(rma_id, reason or "Rejected")
+        status = "ok" if ok else "err"
+        # After processing, redirect back to admin returns with flash message
+        body = f"<p class='{status}'>{html_escape(msg)}</p><p><a href='/admin/returns'>Back to Returns</a></p>"
+        self._send_html(self._wrap_page("Return Processing", body))
+
+    # -----------------------------------------------------------------
+    # Handle return request submission (POST)
+    # -----------------------------------------------------------------
+    def _handle_return_request_post(self) -> None:
+        """Submit a return request for a sale."""
+        app: RetailApp = self.session["app"]  # type: ignore[assignment]
+        username = self.session.get("username")
+        if not username or not getattr(app, "_current_user_id", None):
+            self._send_html(self._wrap_page("Unauthorized", "<p>You must be logged in to submit a return request.</p>"), 403)
+            return
+        params = self._parse_post_data()
+        sale_id_str = params.get("sale_id")
+        reason = params.get("reason", "").strip()
+        try:
+            sale_id = int(sale_id_str) if sale_id_str else None
+        except ValueError:
+            sale_id = None
+        if not sale_id or not reason:
+            self._send_html(self._wrap_page("Error", "<p>Missing sale ID or reason.</p>"), 400)
+            return
+        ok, msg = app.request_return(sale_id, reason)
+        status = "ok" if ok else "err"
+        body = f"<p class='{status}'>{html_escape(msg)}</p><p><a href='/orders'>Back to Orders</a></p>"
+        self._send_html(self._wrap_page("Return Requested", body))
+
+    # -----------------------------------------------------------------
+    # Simple metrics dashboard
+    # -----------------------------------------------------------------
+    def _handle_dashboard_get(self) -> None:
+        """Display a simple dashboard summarizing key metrics."""
+        # Generate Prometheus-style metrics text and embed in page
+        try:
+            metrics_text = generate_metrics_text().decode("utf-8")
+        except Exception as e:
+            metrics_text = f"Error generating metrics: {str(e)}"
+        body = """
+<h1>Metrics Dashboard</h1>
+<p>This dashboard displays raw metrics for observability and monitoring purposes. Use a Prometheus-compatible tool to scrape <code>/metrics</code> endpoint.</p>
+<pre style='background:#f7f7f7;padding:1rem;border:1px solid #ddd;overflow-x:auto'>{}</pre>
+""".format(html_escape(metrics_text))
+        self._send_html(self._wrap_page("Metrics Dashboard", body))
+
+
+def run_server(host: str = "0.0.0.0", port: int = 8000) -> None:
     """Start the threaded HTTP server and serve requests forever."""
     server_address = (host, port)
     httpd = ThreadingHTTPServer(server_address, RetailHTTPRequestHandler)
@@ -1050,7 +1327,7 @@ def run_server(host: str = "localhost", port: int = 8000) -> None:
 
 
 def main() -> None:
-    host = os.environ.get("HOST", "localhost")
+    host = os.environ.get("HOST", "0.0.0.0")
     try:
         port = int(os.environ.get("PORT", "8000"))
     except ValueError:

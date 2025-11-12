@@ -1,0 +1,28 @@
+version: '3.9'
+
+# Docker Compose file for the Retail Application
+#
+# This composition defines a single service, `retailapp`, which builds
+# from the local Dockerfile.  The service exposes port 8000 to the host,
+# mounts the database and logs directories as volumes for persistence,
+# and sets environment variables used by the DAO to locate the SQLite
+# database and schema.  Running `docker compose up` will build and
+# start the application in one command.
+
+services:
+  retailapp:
+    build:
+      context: .. # go up one level to project root
+      dockerfile: deploy/Dockerfile
+    container_name: retailapp
+    ports:
+      - "8000:8000"
+    volumes:
+      # Persist the SQLite database and logs on the host
+      - ../db:/app/db
+      - ../logs:/app/logs
+    environment:
+      # Ensure the DAO uses the correct paths within the container
+      - RETAIL_DB_PATH=/app/db/retail.db
+      - RETAIL_SCHEMA_PATH=/app/db/init.sql
+    restart: unless-stopped

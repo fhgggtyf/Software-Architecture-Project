@@ -210,3 +210,37 @@ CHECKOUT_ERROR_TOTAL = Counter(
     description="Total number of checkout errors, labelled by type",
     label_names=["type"],
 )
+
+# -----------------------------------------------------------------------------
+# Returns/RMA metrics
+#
+# These metrics track the lifecycle of return requests.  They enable the
+# observability requirements of Checkpoint 3: the system must expose
+# metrics such as number of returns per day, approval rates, and
+# average processing time【75†L45-L50】.
+#
+
+# Total number of return requests, labelled by status.  Status values
+# include "Pending", "Approved", "Rejected", and "Refunded".
+RMA_REQUESTS_TOTAL = Counter(
+    name="rma_requests_total",
+    description="Total number of return (RMA) requests, labelled by status",
+    label_names=["status"],
+)
+
+# Histogram measuring the time from RMA submission to resolution (approval or rejection).
+# Buckets cover durations from under a minute to multiple days (in seconds).
+RMA_PROCESSING_DURATION_SECONDS = Histogram(
+    name="rma_processing_duration_seconds",
+    description="Duration of RMA processing from request to resolution",
+    label_names=[],
+    buckets=[60.0, 3600.0, 86400.0, 604800.0],  # 1 min, 1 hour, 1 day, 1 week
+)
+
+# Counter for refunded returns.  Incremented when a return is approved and the refund
+# succeeds.  Labelled by method for future extension (e.g., payment method).
+RMA_REFUNDS_TOTAL = Counter(
+    name="rma_refunds_total",
+    description="Total number of refunds issued as part of RMA processing",
+    label_names=["method"],
+)

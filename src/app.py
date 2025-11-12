@@ -13,6 +13,7 @@ from dao import (
     SaleDAO,
     SaleItemData,
     get_request_connection,
+    ReturnDAO,
 )
 from payment_service import PaymentService
 from external_services import inventory_service, shipping_service, reseller_gateway
@@ -22,6 +23,9 @@ from metrics import (
     CHECKOUT_DURATION_SECONDS,
     CHECKOUT_ERROR_TOTAL,
     CIRCUIT_BREAKER_OPEN,
+    RMA_REQUESTS_TOTAL,
+    RMA_PROCESSING_DURATION_SECONDS,
+    RMA_REFUNDS_TOTAL,
 )
 import logging
 logger = logging.getLogger(__name__)
@@ -97,6 +101,8 @@ class RetailApp:
         self.product_dao = ProductDAO()
         self.sale_dao = SaleDAO()
         self.payment_dao = PaymentDAO()
+        # DAO for return (RMA) requests
+        self.return_dao = ReturnDAO()
         self.payment_service = PaymentService()
 
         # External service integrations for inventory, shipping and resellers.
@@ -195,6 +201,197 @@ class RetailApp:
     def compute_cart_totals(self) -> Totals:
         subtotal = sum(line.unit_price * line.qty for line in self._cart.values())
         return RetailApp.Totals(subtotal=subtotal, total=subtotal)
+
+    # ---- Returns / RMA ----
+
+    def request_return(self, sale_id: int, reason: str) -> Tuple[bool, str]:
+        """Submit a return (RMA) request for a completed sale.
+
+        The current user must be logged in.  Each sale may only have one
+        active return request.  The sale must belong to the user and have
+        status 'Completed'.  A unique RMA number is generated for tracking.
+
+        Metrics: increments the RMA_REQUESTS_TOTAL counter with status 'Pending'.
+
+        Args:
+            sale_id: The ID of the sale being returned.
+            reason: Reason provided by the user for returning the item(s).
+
+        Returns:
+            Tuple of (success, message).
+        """
+        # Ensure user is logged in
+        if not self._current_user_id:
+            return False, "You must be logged in to request a return."
+        # Fetch the sale and validate ownership
+        conn = get_request_connection()
+        row = conn.execute(
+            "SELECT user_id, status FROM Sale WHERE id = ?;",
+            (sale_id,),
+        ).fetchone()
+        if not row:
+            return False, "Sale not found."
+        sale_user_id, sale_status = row
+        if sale_user_id != self._current_user_id:
+            return False, "You can only return your own purchases."
+        if sale_status != "Completed":
+            return False, f"Sale status must be Completed to request a return (current: {sale_status})."
+        # Check if a return already exists for this sale
+        existing_returns = [r for r in self.return_dao.list_returns(self._current_user_id) if r.sale_id == sale_id]
+        if existing_returns:
+            return False, "A return request already exists for this sale."
+        # Generate unique RMA number
+        rma_number = f"RMA-{int(time.time() * 1000)}"
+        # Create the return request
+        rma_id = self.return_dao.create_return_request(
+            sale_id=sale_id,
+            user_id=self._current_user_id,
+            rma_number=rma_number,
+            reason=reason,
+            status="Pending",
+        )
+        # Record metrics
+        try:
+            RMA_REQUESTS_TOTAL.inc(status="Pending")
+        except Exception:
+            pass
+        # Log the request
+        logger.info(
+            "Return requested",
+            extra={
+                "request_id": rma_number,
+                "user_id": self._current_user_id,
+                "extra": {"sale_id": sale_id, "rma_id": rma_id, "reason": reason},
+            },
+        )
+        return True, f"Return request submitted. Your RMA number is {rma_number}."
+
+    def _calculate_rma_duration(self, request_ts: str) -> float:
+        """Compute the duration in seconds from an ISO timestamp to now."""
+        try:
+            from datetime import datetime
+            start = datetime.fromisoformat(request_ts)
+            # Use the same timezone as the start time (may be naive/aware)
+            tz = start.tzinfo
+            now = datetime.now(tz) if tz else datetime.now()
+            return max(0.0, (now - start).total_seconds())
+        except Exception:
+            return 0.0
+
+    def approve_return(self, rma_id: int) -> Tuple[bool, str]:
+        """Approve a pending return request and process the refund.
+
+        The method refunds the full sale amount, updates the return status to
+        'Approved', marks the associated sale as 'Refunded', and restocks
+        returned items.  Appropriate metrics are recorded.
+
+        Args:
+            rma_id: ID of the return request.
+
+        Returns:
+            Tuple (success, message).
+        """
+        rma = self.return_dao.get_return(rma_id)
+        if not rma:
+            return False, "Return request not found."
+        if rma.status != "Pending":
+            return False, f"Return already processed (status={rma.status})."
+        # Get the payment for the sale
+        payment = self.payment_dao.get_payment_for_sale(rma.sale_id)
+        if not payment:
+            # No payment found — cannot refund
+            self.return_dao.update_return_status(rma_id, "Rejected", None)
+            try:
+                RMA_REQUESTS_TOTAL.inc(status="Rejected")
+            except Exception:
+                pass
+            return False, "No payment record found; return rejected."
+        # Attempt refund via payment service
+        approved, refund_ref = self.payment_service.refund_payment(payment.reference, payment.amount)
+        if not approved:
+            # Refund failed
+            self.return_dao.update_return_status(rma_id, "Rejected", None)
+            try:
+                RMA_REQUESTS_TOTAL.inc(status="Rejected")
+            except Exception:
+                pass
+            return False, "Refund failed; return request rejected."
+        # Refund succeeded: update return status
+        self.return_dao.update_return_status(rma_id, "Approved", refund_ref)
+        # Update sale status
+        self.sale_dao.update_sale_status(rma.sale_id, "Refunded")
+        # Restock items from the original sale
+        items = self.sale_dao.get_sale_items(rma.sale_id)
+        for it in items:
+            try:
+                self.product_dao.increase_stock(it.product_id, it.quantity)
+            except Exception:
+                pass
+        # Compute processing duration and record metrics
+        duration = self._calculate_rma_duration(rma.request_timestamp)
+        try:
+            RMA_PROCESSING_DURATION_SECONDS.observe(duration)
+        except Exception:
+            pass
+        # Increment counters
+        try:
+            RMA_REQUESTS_TOTAL.inc(status="Approved")
+        except Exception:
+            pass
+        try:
+            RMA_REFUNDS_TOTAL.inc(method=payment.method)
+        except Exception:
+            pass
+        # Log approval
+        logger.info(
+            "Return approved",
+            extra={
+                "request_id": rma.rma_number,
+                "user_id": self._current_user_id,
+                "extra": {"sale_id": rma.sale_id, "rma_id": rma_id, "refund_ref": refund_ref},
+            },
+        )
+        return True, "Return approved and refund processed."
+
+    def reject_return(self, rma_id: int, reason: str) -> Tuple[bool, str]:
+        """Reject a pending return request.
+
+        Sets the return status to 'Rejected' and records metrics.
+
+        Args:
+            rma_id: ID of the return request.
+            reason: Explanation for rejection (included in logs).
+
+        Returns:
+            Tuple (success, message).
+        """
+        rma = self.return_dao.get_return(rma_id)
+        if not rma:
+            return False, "Return request not found."
+        if rma.status != "Pending":
+            return False, f"Return already processed (status={rma.status})."
+        # Update status
+        self.return_dao.update_return_status(rma_id, "Rejected", None)
+        # Metrics
+        duration = self._calculate_rma_duration(rma.request_timestamp)
+        try:
+            RMA_PROCESSING_DURATION_SECONDS.observe(duration)
+        except Exception:
+            pass
+        try:
+            RMA_REQUESTS_TOTAL.inc(status="Rejected")
+        except Exception:
+            pass
+        # Log rejection
+        logger.info(
+            "Return rejected",
+            extra={
+                "request_id": rma.rma_number,
+                "user_id": self._current_user_id,
+                "extra": {"sale_id": rma.sale_id, "rma_id": rma_id, "reason": reason},
+            },
+        )
+        return True, f"Return request rejected: {reason}"
 
     # ---- Checkout ----
 

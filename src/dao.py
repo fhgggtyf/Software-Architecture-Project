@@ -71,17 +71,67 @@ def _apply_schema_if_needed(conn: sqlite3.Connection) -> None:
 # ------------------------------------------------------------------------------
 # Connection management with fallback
 # ------------------------------------------------------------------------------
-def _new_connection(read_only=False) -> sqlite3.Connection:
+def _new_connection(read_only: bool = False) -> sqlite3.Connection:
+    """Create a new SQLite connection with concurrency safeguards.
+
+    This helper sets a busy timeout and enables Write‑Ahead Logging (WAL) on
+    write‑enabled connections to mitigate ``database is locked`` errors under
+    multi‑threaded access.  WAL mode allows concurrent reads during a write
+    transaction, and the timeout instructs SQLite to wait for a lock to clear
+    rather than failing immediately.
+
+    Args:
+        read_only: Open the database in read‑only mode when True.  Read‑only
+            connections do not attempt to enable WAL.
+
+    Returns:
+        A configured :class:`sqlite3.Connection` instance.
+
+    Raises:
+        sqlite3.OperationalError: If the database cannot be opened.
+    """
     db_path = _resolve_db_path()
     _ensure_parent_dir(db_path)
     try:
         if read_only:
+            # Use URI mode with ``mode=ro`` for read‑only access.  Provide a
+            # timeout so SQLite will wait briefly if the database is busy.
             uri = f"file:{db_path}?mode=ro"
-            conn = sqlite3.connect(uri, uri=True, check_same_thread=False)
+            conn = sqlite3.connect(
+                uri,
+                uri=True,
+                check_same_thread=False,
+                timeout=10.0,
+            )
         else:
-            conn = sqlite3.connect(db_path, check_same_thread=False)
+            # For write‑enabled connections, include a timeout and allow
+            # multi‑thread access.
+            conn = sqlite3.connect(
+                db_path,
+                check_same_thread=False,
+                timeout=10.0,
+            )
+        # Rows behave like dictionaries for convenience
         conn.row_factory = sqlite3.Row
+        # Enforce foreign key constraints
         conn.execute("PRAGMA foreign_keys = ON;")
+        # Set a busy timeout on every connection.  Although ``timeout`` in
+        # sqlite3.connect() applies to the initial lock attempt, setting
+        # PRAGMA busy_timeout extends the waiting period for locks acquired
+        # within transactions.  This helps avoid ``database is locked`` errors
+        # when concurrent writes overlap.
+        try:
+            conn.execute("PRAGMA busy_timeout = 10000;")  # 10 seconds
+        except sqlite3.OperationalError:
+            pass
+        # Enable WAL mode on writable connections to improve concurrency
+        if not read_only:
+            try:
+                conn.execute("PRAGMA journal_mode = WAL;")
+            except sqlite3.OperationalError:
+                # If enabling WAL fails (e.g. unsupported filesystem), continue
+                pass
+        # Apply schema if this is a brand‑new DB
         _apply_schema_if_needed(conn)
         return conn
     except sqlite3.OperationalError as e:
@@ -201,6 +251,8 @@ class Sale:
     subtotal: float
     total: float
     status: str
+
+
 
 
 # ------------------------------------------------------------------------------
@@ -457,6 +509,29 @@ class ProductDAO(BaseDAO):
             )
         return cur.rowcount > 0
 
+    def increase_stock(self, product_id: int, qty: int) -> bool:
+        """Increase the available stock of a product by a specified quantity.
+
+        This method is used when processing approved returns to put items back
+        into inventory.  It rejects negative increments.
+
+        Args:
+            product_id: ID of the product to update.
+            qty: Quantity to add to stock.  Must be non-negative.
+
+        Returns:
+            True if the update succeeded (a row was affected), False otherwise.
+        """
+        if qty < 0:
+            raise ValueError("Quantity to increase must be non-negative")
+        conn = self._conn()
+        with conn:
+            cur = conn.execute(
+                "UPDATE Product SET stock = stock + ? WHERE id = ?;",
+                (qty, product_id),
+            )
+        return cur.rowcount > 0
+
     def update_name_price(self, product_id: int, name: str, price: float) -> None:
         conn = self._conn()
         with conn:
@@ -504,6 +579,21 @@ class PaymentDAO(BaseDAO):
             (sale_id, method, reference, amount, status, ts),
         )
         return cur.lastrowid
+
+    def get_payment_for_sale(self, sale_id: int) -> Optional[Payment]:
+        """Return the first payment record associated with a sale.
+
+        Args:
+            sale_id: ID of the sale.
+
+        Returns:
+            A Payment dataclass instance or None if no payment exists.
+        """
+        row = self._conn().execute(
+            "SELECT id, sale_id, method, reference, amount, status, timestamp FROM Payment WHERE sale_id = ? LIMIT 1;",
+            (sale_id,),
+        ).fetchone()
+        return Payment(*row) if row else None
 
 
 # ------------------------------------------------------------------------------
@@ -565,3 +655,162 @@ class SaleDAO(BaseDAO):
                 [(sale_id, it.product_id, it.quantity, it.unit_price) for it in items],
             )
         return sale_id
+
+    def get_sale_items(self, sale_id: int) -> List[SaleItemData]:
+        """Return all items associated with a sale.
+
+        Args:
+            sale_id: ID of the sale.
+
+        Returns:
+            A list of SaleItemData objects representing the items and quantities
+            purchased in the sale.
+        """
+        rows = self._conn().execute(
+            "SELECT product_id, quantity, unit_price FROM SaleItem WHERE sale_id = ?;",
+            (sale_id,),
+        ).fetchall()
+        return [SaleItemData(product_id=r[0], quantity=r[1], unit_price=r[2]) for r in rows]
+
+    def update_sale_status(self, sale_id: int, status: str) -> bool:
+        """Update the status of a sale.
+
+        This helper is used by the returns module to mark a sale as
+        'Refunded' or other statuses.  Returns True if at least one row
+        was updated.
+        """
+        conn = self._conn()
+        with conn:
+            cur = conn.execute(
+                "UPDATE Sale SET status = ? WHERE id = ?;",
+                (status, sale_id),
+            )
+        return cur.rowcount > 0
+
+# ------------------------------------------------------------------------------
+# Returns / RMA
+# ------------------------------------------------------------------------------
+
+@dataclass
+class ReturnRequest:
+    """Data model for a return (RMA) request."""
+
+    id: int
+    sale_id: int
+    user_id: int
+    rma_number: str
+    reason: str
+    status: str
+    request_timestamp: str
+    resolution_timestamp: str | None = None
+    refund_reference: str | None = None
+
+
+class ReturnDAO(BaseDAO):
+    """DAO for managing return requests (RMAs)."""
+
+    def create_table(self) -> None:
+        """Ensure the Return table exists.  The schema is defined in init.sql,
+        but we include a CREATE TABLE IF NOT EXISTS statement here for safety
+        when init.sql has not yet been applied."""
+        self._conn().execute(
+            """
+            CREATE TABLE IF NOT EXISTS Return (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sale_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                rma_number TEXT NOT NULL,
+                reason TEXT NOT NULL,
+                status TEXT NOT NULL,
+                request_timestamp TEXT NOT NULL,
+                resolution_timestamp TEXT,
+                refund_reference TEXT,
+                FOREIGN KEY (sale_id) REFERENCES Sale(id),
+                FOREIGN KEY (user_id) REFERENCES User(id)
+            );
+            """
+        )
+
+    def create_return_request(
+        self, sale_id: int, user_id: int, rma_number: str, reason: str, status: str = "Pending"
+    ) -> int:
+        """Insert a new return request into the database.
+
+        Args:
+            sale_id: ID of the sale being returned.
+            user_id: ID of the user submitting the return.
+            rma_number: Unique identifier for the return (e.g. generated by application).
+            reason: Reason provided by the user.
+            status: Initial status (default 'Pending').
+
+        Returns:
+            The new return request ID.
+        """
+        conn = self._conn()
+        ts = datetime.now(UTC).isoformat()
+        # Use a context manager to ensure the INSERT is committed. Without
+        # wrapping in ``with conn``, SQLite defers the transaction until the
+        # connection is closed, which may never happen for thread‑local
+        # connections.  Committing immediately guarantees that the new return
+        # request is persisted and visible to subsequent queries.
+        with conn:
+            cur = conn.execute(
+                "INSERT INTO Return (sale_id, user_id, rma_number, reason, status, request_timestamp)"
+                " VALUES (?, ?, ?, ?, ?, ?);",
+                (sale_id, user_id, rma_number, reason, status, ts),
+            )
+        return cur.lastrowid
+
+    def update_return_status(
+        self, return_id: int, status: str, refund_reference: str | None = None
+    ) -> bool:
+        """Update the status and optionally refund reference for a return request.
+
+        Args:
+            return_id: The return request ID.
+            status: New status ('Approved', 'Rejected', 'Refunded').
+            refund_reference: Optional payment refund reference returned from payment service.
+
+        Returns:
+            True if the update affected at least one row; False otherwise.
+        """
+        conn = self._conn()
+        ts = datetime.now(UTC).isoformat()
+        with conn:
+            cur = conn.execute(
+                "UPDATE Return SET status = ?, resolution_timestamp = ?, refund_reference = ? WHERE id = ?;",
+                (status, ts, refund_reference, return_id),
+            )
+        return cur.rowcount > 0
+
+    def get_return(self, return_id: int) -> Optional[ReturnRequest]:
+        """Fetch a return request by ID."""
+        row = self._conn().execute(
+            "SELECT id, sale_id, user_id, rma_number, reason, status, request_timestamp, resolution_timestamp, refund_reference"
+            " FROM Return WHERE id = ?;",
+            (return_id,),
+        ).fetchone()
+        return ReturnRequest(*row) if row else None
+
+    def list_returns(self, user_id: int | None = None) -> list[ReturnRequest]:
+        """List return requests.  If user_id is provided, returns only that user's requests; otherwise, returns all.
+
+        Args:
+            user_id: Optional user ID to filter by.
+
+        Returns:
+            List of ReturnRequest objects.
+        """
+        conn = self._conn()
+        if user_id is not None:
+            rows = conn.execute(
+                "SELECT id, sale_id, user_id, rma_number, reason, status, request_timestamp, resolution_timestamp, refund_reference"
+                " FROM Return WHERE user_id = ? ORDER BY id;",
+                (user_id,),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT id, sale_id, user_id, rma_number, reason, status, request_timestamp, resolution_timestamp, refund_reference"
+                " FROM Return ORDER BY id;"
+            ).fetchall()
+        return [ReturnRequest(*r) for r in rows]
