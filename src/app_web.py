@@ -1185,7 +1185,7 @@ window.addEventListener('load', updateCountdown);
             return
         user_id = getattr(app, "_current_user_id", None)
         try:
-            requests = app.return_dao.list_returns(user_id)
+            requests = app.return_dao.list_returns()
         except Exception as e:
             self._send_html(self._wrap_page("Error", f"<p>Error fetching returns: {html_escape(str(e))}</p>"), 500)
             return
