@@ -113,40 +113,6 @@ Updated as required for Checkpoint 4:
 
 ---
 
-## Instructions for Running (unchanged)
-
-### Basic run
-
-```
-python src/app_web.py
-```
-
-### Specific DB
-
-```
-RETAIL_DB_PATH=./db/retail.db python src/app_web.py
-```
-
-### Specific port
-
-```
-PORT=8080 python src/app_web.py
-```
-
-### Custom low-stock threshold
-
-```
-LOW_STOCK_THRESHOLD=3 python src/app_web.py
-```
-
-### Metrics endpoint
-
-```
-/metrics
-```
-
----
-
 ## Team
 
 - **Kwabena Sekyi-Djan**  
