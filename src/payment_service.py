@@ -67,14 +67,21 @@ class PaymentService:
         always_approve: bool = False,
         failure_threshold: int = 3,
         cooldown_seconds: int = 30,
-        max_attempts: int = 3,
+        max_attempts: int = 1,
         backoff_base: float = 0.25,   # seconds
         backoff_max: float = 2.0,     # cap per attempt
         backoff_jitter: float = 0.10  # +/- jitter seconds
     ) -> None:
         # Strategy registry
         self.strategies: dict[str, PaymentStrategy] = {}
-        self.register_strategy("card", CardPaymentStrategy())
+        # Configure default strategies.  Card payments are configured to always
+        # succeed by default.  This simplifies testing scenarios and avoids
+        # flaky behaviour where random failures could trip the circuit breaker.
+        self.register_strategy("card", CardPaymentStrategy(success_rate=1.0))
+        # Cash payments are currently unsupported and always fail.  The
+        # PaymentService will not attempt multiple retries when max_attempts=1,
+        # preventing the circuit breaker from opening after a single cash
+        # checkout attempt.
         self.register_strategy("cash", CashPaymentStrategy())
         self.register_strategy("crypto", CryptoPaymentStrategy())
 

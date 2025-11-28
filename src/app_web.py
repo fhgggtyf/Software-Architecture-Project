@@ -38,6 +38,30 @@ from app import RetailApp
 from external_services import reseller_gateway  # ensure gateway imported for future use
 import json
 
+# -----------------------------------------------------------------------------
+# Configuration
+#
+# New lightweight features for Checkpoint 4 introduce a low‑stock alert
+# mechanism and return status notifications.  The low stock threshold can be
+# customised via an environment variable.  If the variable is not set, a
+# sensible default of 5 units is used.  See the checkpoint specification for
+# details.
+LOW_STOCK_THRESHOLD: int = int(os.environ.get("LOW_STOCK_THRESHOLD", "5"))
+
+# Mapping of internal return statuses to user‑facing labels.  When a user
+# submits a return request it begins in the ``Pending`` state, which we
+# present as ``Submitted`` for clarity.  Additional statuses such as
+# ``Received`` and ``Inspected`` are included for completeness even though the
+# current admin UI does not yet expose those transitions.
+_RMA_STATUS_DISPLAY: dict[str, str] = {
+    "Pending": "Submitted",
+    "Approved": "Approved",
+    "Rejected": "Rejected",
+    "Refunded": "Refunded",
+    "Received": "Received",
+    "Inspected": "Inspected",
+}
+
 # Configure logging and import metrics
 import logging_config  # custom logging configuration module
 from metrics import (
@@ -278,6 +302,73 @@ class RetailHTTPRequestHandler(BaseHTTPRequestHandler):
 </main>
 </body>
 </html>"""
+
+    # -----------------------------------------------------------------
+    # Return (RMA) status notifications
+    #
+    # To improve usability and transparency around the returns workflow, we
+    # maintain a record of the last seen status for each RMA in the session.  When
+    # a return request transitions to a new state (e.g. from Pending to Approved
+    # or Refunded), a notification is displayed the next time the user visits
+    # their orders or returns pages.  Notifications are presented once per
+    # session and then cleared when the user navigates away or reloads the page.
+    def _get_rma_notifications(self, app: RetailApp) -> str:
+        """Return a block of HTML notifications for updated return statuses.
+
+        This helper inspects all return requests belonging to the current
+        logged‑in user.  It compares the current status of each request
+        against the last status stored in the session (``rma_statuses``).  If a
+        change is detected, a message is generated and the new status is
+        recorded.  On first visit, statuses are recorded silently without
+        notifying the user.  Notifications are returned as a single HTML
+        string; if no updates exist, an empty string is returned.
+
+        Args:
+            app: The current ``RetailApp`` instance.
+
+        Returns:
+            HTML snippet containing one or more notifications or an empty
+            string when no updates exist.
+        """
+        # Only logged in users with a user_id can have returns
+        user_id = getattr(app, "_current_user_id", None)
+        if not user_id:
+            return ""
+        # Ensure a dict to track previously seen statuses exists in the session
+        prev: Dict[int, str] = self.session.get("rma_statuses")  # type: ignore[assignment]
+        if not isinstance(prev, dict):
+            prev = {}
+            self.session["rma_statuses"] = prev
+        # Attempt to fetch current return requests.  If this fails (e.g. DB
+        # unavailable), suppress notifications to avoid crashing the page.
+        try:
+            requests = app.return_dao.list_returns(user_id)
+        except Exception:
+            return ""
+        notes: list[str] = []
+        for r in requests:
+            current_status: str = r.status
+            # Determine the display label for the status
+            display = _RMA_STATUS_DISPLAY.get(current_status, current_status)
+            # If this RMA hasn't been seen before, initialise its status and
+            # continue without notifying.  This avoids spamming the user the
+            # first time they view their returns.
+            if r.id not in prev:
+                prev[r.id] = current_status
+                continue
+            # Compare against last stored status
+            last_status = prev.get(r.id)
+            if last_status != current_status:
+                # Record new status and queue a notification
+                prev[r.id] = current_status
+                notes.append(
+                    f"<script>alert('Return {html_escape(r.rma_number)} status updated: {html_escape(display)}');</script>"
+                )
+
+        if not notes:
+            return ""
+        # Wrap all notifications in a container for styling
+        return "<div class='notifications'>" + "".join(notes) + "</div>"
 
     # --------------
     # Request entry
@@ -610,6 +701,22 @@ window.addEventListener('load', updateCountdown);
             self._send_html(self._wrap_page("Unauthorized", "<p>You do not have permission to access this page.</p>"), 403)
             return
         products = app.list_products()
+        # Determine which products are below the low stock threshold.  If the
+        # threshold is zero or negative, no alerts are shown.  We do not
+        # perform database queries here; rather we operate on the list of
+        # products returned from the DAO.
+        low_stock_items = []
+        try:
+            threshold = LOW_STOCK_THRESHOLD
+        except Exception:
+            threshold = 0
+        if threshold > 0:
+            for p in products:
+                try:
+                    if p.stock < threshold:
+                        low_stock_items.append(p)
+                except Exception:
+                    continue
         rows = []
         for p in products:
             rows.append(
@@ -621,9 +728,24 @@ window.addEventListener('load', updateCountdown);
         # Avoid using a backslash in f-string expressions by joining rows outside
         # of the f-string.
         rows_html = "\n".join(rows)
+        # Build low stock alerts section if applicable
+        alerts_html = ""
+        if low_stock_items:
+            alert_rows = []
+            for p in low_stock_items:
+                alert_rows.append(
+                    f"<li>{html_escape(p.name)} (ID {p.id}) — {p.stock} left</li>"
+                )
+            alerts_html = """
+<div class='low-stock'>
+  <h2>Low Stock Alerts</h2>
+  <ul>{}</ul>
+</div>
+""".format("\n".join(alert_rows))
         table_html = f"""
 <h1>Admin Products</h1>
 <p><a href='/admin/product/new'>Add New Product</a></p>
+{alerts_html}
 <table>
   <tr><th>ID</th><th>Name</th><th>Price</th><th>Stock</th><th></th><th></th></tr>
   {rows_html}
@@ -1100,7 +1222,8 @@ window.addEventListener('load', updateCountdown);
             self._send_html(self._wrap_page("Unauthorized", "<p>You must be logged in to view orders.</p>"), 403)
             return
         user_id = getattr(app, "_current_user_id", None)
-        # Query the Sale table for this user
+        # Fetch all orders for this user.  Filters (status/date/keyword) are
+        # applied in Python below to simplify the SQL and minimise coupling.
         try:
             from dao import get_request_connection
             conn = get_request_connection()
@@ -1116,18 +1239,62 @@ window.addEventListener('load', updateCountdown);
             existing = {r.sale_id: r for r in app.return_dao.list_returns(user_id)}
         except Exception:
             existing = {}
-        rows_html = []
+        # Parse query parameters for filters
+        # Expect keys: status (Completed, Pending, Returned, Refunded),
+        # start (YYYY‑MM‑DD), end (YYYY‑MM‑DD), q (keyword for product name or order id)
+        raw_qs = self.path.partition("?")[2]
+        params = urllib.parse.parse_qs(raw_qs, keep_blank_values=True)
+        status_filter = params.get("status", [""])[0].strip()
+        start_date = params.get("start", [""])[0].strip()
+        end_date = params.get("end", [""])[0].strip()
+        keyword = params.get("q", [""])[0].strip().lower()
+        # Prepare filtered list of rows
+        # Will hold the filtered set of sale rows
+        filtered_rows: list = []
         for r in rows:
             sale_id, ts, total, status = r["id"], r["timestamp"], r["total"], r["status"]
-            # Format timestamp (ISO) to something nicer
+            # Status filter
+            if status_filter and status != status_filter:
+                continue
+            # Date range filter (compare date part only)
+            date_part = ts[:10] if ts else ""
+            if start_date and date_part < start_date:
+                continue
+            if end_date and date_part > end_date:
+                continue
+            # Keyword search: match sale id or product name
+            if keyword:
+                match = False
+                # Check in sale ID
+                if keyword in str(sale_id).lower():
+                    match = True
+                else:
+                    # Check products in this sale
+                    try:
+                        items = app.sale_dao.get_sale_items(sale_id)
+                        for it in items:
+                            prod = app.product_dao.get_product(it.product_id)
+                            if prod and keyword in prod.name.lower():
+                                match = True
+                                break
+                    except Exception:
+                        # If lookup fails, ignore product name search
+                        match = False
+                if not match:
+                    continue
+            # Passed all filters
+            filtered_rows.append(r)
+        # Build HTML rows
+        rows_html: list[str] = []
+        for r in filtered_rows:
+            sale_id, ts, total, status = r["id"], r["timestamp"], r["total"], r["status"]
             ts_str = html_escape(ts)
             # Determine return action/status
             if sale_id in existing:
                 rma = existing[sale_id]
-                rma_status = rma.status
+                rma_status = _RMA_STATUS_DISPLAY.get(rma.status, rma.status)
                 return_html = f"{html_escape(rma_status)} (RMA {html_escape(rma.rma_number)})"
             elif status == "Completed":
-                # Provide link to request return
                 return_html = (
                     f"<form method='get' action='/return-request' style='display:inline'>"
                     f"<input type='hidden' name='sale_id' value='{sale_id}' />"
@@ -1139,11 +1306,47 @@ window.addEventListener('load', updateCountdown);
                 f"<tr><td>{sale_id}</td><td>{ts_str}</td><td>{total:.2f}</td><td>{html_escape(status)}</td>"
                 f"<td>{return_html}</td></tr>"
             )
-        body = """
+        # Compose filter form HTML.  Preselect current values for usability.
+        # Note: html_escape is used on user‑supplied values to avoid injection.
+        status_options = [
+            ("", "All"),
+            ("Completed", "Completed"),
+            ("Pending", "Pending"),
+            ("Returned", "Returned"),
+            ("Refunded", "Refunded"),
+        ]
+        status_select = ["<option value=''{}>All</option>".format(
+            " selected" if status_filter == "" else ""
+        )]
+        # Build options manually to avoid backslashes in f‑strings
+        status_select = []
+        for val, label in status_options:
+            sel = " selected" if status_filter == val else ""
+            status_select.append(f"<option value='{html_escape(val)}'{sel}>{html_escape(label)}</option>")
+        status_html = "".join(status_select)
+        filter_form = f"""
+<form method='get' action='/orders' style='margin-bottom:1rem'>
+  <label>Status:
+    <select name='status'>
+      {status_html}
+    </select>
+  </label>
+  <label>From: <input type='date' name='start' value='{html_escape(start_date)}'></label>
+  <label>To: <input type='date' name='end' value='{html_escape(end_date)}'></label>
+  <label>Search: <input type='text' name='q' value='{html_escape(keyword)}' placeholder='Product or Order ID'></label>
+  <button type='submit'>Filter</button>
+</form>
+"""
+        # Generate any return status notifications
+        notifications_html = self._get_rma_notifications(app)
+        # Assemble final page body
+        body = f"""
 <h1>My Orders</h1>
+{notifications_html}
+{filter_form}
 <table>
   <tr><th>Sale ID</th><th>Timestamp</th><th>Total</th><th>Status</th><th>Return</th></tr>
-  {} 
+  {{}}
 </table>
 """.format("\n".join(rows_html))
         self._send_html(self._wrap_page("Orders", body))
@@ -1195,15 +1398,20 @@ window.addEventListener('load', updateCountdown);
             req_ts = html_escape(r.request_timestamp)
             res_ts = html_escape(r.resolution_timestamp) if r.resolution_timestamp else "-"
             refund_ref = html_escape(r.refund_reference) if r.refund_reference else "-"
+            # Use user‑facing label for status
+            status_label = _RMA_STATUS_DISPLAY.get(r.status, r.status)
             rows_html.append(
                 f"<tr><td>{r.id}</td><td>{html_escape(r.rma_number)}</td><td>{r.sale_id}</td><td>{html_escape(r.reason)}</td>"
-                f"<td>{html_escape(r.status)}</td><td>{req_ts}</td><td>{res_ts}</td><td>{refund_ref}</td></tr>"
+                f"<td>{html_escape(status_label)}</td><td>{req_ts}</td><td>{res_ts}</td><td>{refund_ref}</td></tr>"
             )
-        body = """
+        # Generate notifications for any status changes
+        notifications_html = self._get_rma_notifications(app)
+        body = f"""
 <h1>My Return Requests</h1>
+{notifications_html}
 <table>
   <tr><th>ID</th><th>RMA Number</th><th>Sale ID</th><th>Reason</th><th>Status</th><th>Requested</th><th>Resolved</th><th>Refund Ref</th></tr>
-  {} 
+  {{}}
 </table>
 """.format("\n".join(rows_html))
         self._send_html(self._wrap_page("Returns", body))
