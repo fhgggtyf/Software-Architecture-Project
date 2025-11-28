@@ -1,12 +1,157 @@
-# Retail Store Application – Software Architecture Project
+# Retail Store Application – Software Architecture Project (Updated for Checkpoint 4)
 
-This repository contains an enhanced retail application used to explore software architecture patterns and quality attributes. While the original checkpoint showcased a simple two‑tier system, the updated version demonstrates how to build a more feature‑rich system using only Python’s standard library. It now supports concurrency, external integrations, partner feed ingestion, extensible payment methods, circuit breaking, retry logic, metrics, logging and real‑time flash sales. Data continues to be stored locally in SQLite, and the persistence layer is abstracted via Data Access Objects (DAOs).
+This README extends the original project README by documenting the lightweight features implemented for Checkpoint 4.  
+The core architecture is unchanged: a Python-only retail application that demonstrates:
 
-## Team Members
+- Layered architecture (web/controller, application, service, DAO, DB)
+- Strategy pattern for payments
+- Circuit breaker with retry and exponential backoff
+- Partner ingestion via adapter pattern
+- Structured logging and metrics for observability
 
-This project was completed by the following team members:  
-- Kwabena Sekyi-Djan  
-- Jiacheng Xia
+---
+
+## New in Checkpoint 4 – Lightweight Features
+
+Checkpoint 4 adds three usability-oriented features:
+
+1. **Order History Filtering & Search**  
+2. **Low-Stock Alerts for Admins**  
+3. **Return Status (RMA) Notifications**
+
+These are implemented entirely in the web/controller layer (`app_web.py`) and re-use existing DAOs and database schema.
+
+---
+
+### 1. Order History Filtering & Search
+
+**Endpoint:** `/orders`
+
+Features:
+
+- Filter orders by status (`Completed`, `Pending`, `Returned`, `Refunded`)
+- Filter by date range
+- Keyword search across:
+  - Order ID
+  - Product names
+- Uses query parameters: `status`, `start`, `end`, `q`
+
+Example:
+
+```
+/orders?status=Completed&start=2025-11-01&end=2025-11-30&q=keyboard
+```
+
+Implementation notes:
+
+- Filtering logic lives in `app_web.py`
+- DAOs are unchanged
+- Product keywords resolved using `SaleDAO` + `ProductDAO`
+
+---
+
+### 2. Low-Stock Alerts (Admin)
+
+**Where:** `/admin/products`
+
+Low-stock alerts appear automatically when stock is below a configurable threshold.
+
+To run with a custom threshold:
+
+```
+LOW_STOCK_THRESHOLD=5 python src/app_web.py
+```
+
+- Uses existing `product_dao.list_products()`
+- No schema changes required
+
+---
+
+### 3. Return Status (RMA) Notifications
+
+**Where:** `/orders` and `/returns`
+
+System now detects RMA status changes and displays notifications.
+
+- Session stores last-known return statuses
+- On page load, new statuses are compared
+- A lightweight popup or inline message is rendered
+- No CSS or external JS libraries required
+
+Notification engine lives in:
+
+- `_get_rma_notifications()` inside `app_web.py`
+
+---
+
+## Updated Documentation (docs/ folder)
+
+Updated as required for Checkpoint 4:
+
+- **Use Case View**  
+  Added three new use cases:
+  - Filter/Search Orders
+  - Low-Stock Alerts
+  - RMA Status Notifications
+
+- **Logical View**  
+  Updated controller responsibilities:
+  - Filtering logic
+  - Stock threshold logic
+  - RMA notification helper
+
+- **Process View**  
+  One updated/new sequence diagram (Filtering or RMA Notification)
+
+- **Deployment View**  
+  Added `LOW_STOCK_THRESHOLD` as a documented environment variable
+
+- **ADR files**  
+  Added:
+  - ADR: Lightweight Features Design
+  - ADR: Documentation Improvements
+
+---
+
+## Instructions for Running (unchanged)
+
+### Basic run
+
+```
+python src/app_web.py
+```
+
+### Specific DB
+
+```
+RETAIL_DB_PATH=./db/retail.db python src/app_web.py
+```
+
+### Specific port
+
+```
+PORT=8080 python src/app_web.py
+```
+
+### Custom low-stock threshold
+
+```
+LOW_STOCK_THRESHOLD=3 python src/app_web.py
+```
+
+### Metrics endpoint
+
+```
+/metrics
+```
+
+---
+
+## Team
+
+- **Kwabena Sekyi-Djan**  
+- **Jiacheng Xia**
+
 
 ## Project Structure
 
